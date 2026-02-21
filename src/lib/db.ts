@@ -1,0 +1,164 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export type DbCollectionRecord = {
+  id: string;
+  parentId: string | null;
+  name: string;
+  color: string;
+  createdAt: number;
+};
+
+export type DbThumbStatus = "ready" | "pending" | "skipped" | "error";
+export type DbImportStatus = "ready" | "processing" | "error";
+
+export type DbItemRecord = {
+  id: string;
+  collectionId: string | null;
+  type: string;
+  title: string;
+  filename: string;
+  vaultKey: string;
+  vaultPath: string;
+  previewUrl: string | null;
+  width: number | null;
+  height: number | null;
+  thumbStatus: DbThumbStatus;
+  importStatus: DbImportStatus;
+  description: string | null;
+  createdAt: number;
+  updatedAt: number;
+  tags: string[];
+};
+
+export type DbAppState = {
+  collections: DbCollectionRecord[];
+  items: DbItemRecord[];
+};
+
+export type DbInsertItemInput = {
+  id: string;
+  collectionId: string | null;
+  type: string;
+  title: string;
+  filename: string;
+  vaultKey: string;
+  vaultPath: string;
+  previewUrl: string | null;
+  width: number | null;
+  height: number | null;
+  thumbStatus: DbThumbStatus;
+  importStatus: DbImportStatus;
+  description: string | null;
+  createdAt: number;
+  updatedAt: number;
+  tags: string[];
+};
+
+export type DbVaultCleanupEntry = {
+  vaultKey: string;
+  vaultPath: string;
+  sha256: string;
+  ext: string;
+  deletedFromDisk: boolean;
+};
+
+export type DbDeleteItemsWithCleanupResult = {
+  deletedRows: number;
+  cleanup: DbVaultCleanupEntry[];
+};
+
+export type DbUpdateItemsCollectionResult = {
+  updatedRows: number;
+  updatedAt: number;
+};
+
+export async function initDb(): Promise<string> {
+  return invoke<string>("init_db");
+}
+
+export async function loadDbAppState(): Promise<DbAppState> {
+  return invoke<DbAppState>("load_app_state");
+}
+
+export async function insertDbItem(item: DbInsertItemInput): Promise<void> {
+  return invoke<void>("insert_item", { item });
+}
+
+export async function insertDbItemsBatch(items: DbInsertItemInput[]): Promise<void> {
+  return invoke<void>("insert_items_batch", { items });
+}
+
+export async function deleteDbItems(itemIds: string[]): Promise<number> {
+  return invoke<number>("delete_items", { itemIds });
+}
+
+export async function deleteDbItemsWithCleanup(
+  itemIds: string[],
+): Promise<DbDeleteItemsWithCleanupResult> {
+  return invoke<DbDeleteItemsWithCleanupResult>("delete_items_with_cleanup", { itemIds });
+}
+
+export async function updateDbItemsCollection(
+  itemIds: string[],
+  collectionId: string | null,
+): Promise<DbUpdateItemsCollectionResult> {
+  return invoke<DbUpdateItemsCollectionResult>("update_items_collection", {
+    itemIds,
+    collectionId,
+  });
+}
+
+export async function updateDbItemDescription(
+  itemId: string,
+  description: string,
+): Promise<number> {
+  return invoke<number>("update_item_description", { itemId, description });
+}
+
+export async function updateDbItemMediaState(params: {
+  itemId: string;
+  width?: number | null;
+  height?: number | null;
+  thumbStatus?: DbThumbStatus;
+}): Promise<number> {
+  return invoke<number>("update_item_media_state", {
+    input: {
+      itemId: params.itemId,
+      width: params.width ?? null,
+      height: params.height ?? null,
+      thumbStatus: params.thumbStatus ?? null,
+    },
+  });
+}
+
+export async function finalizeDbItemImport(input: {
+  itemId: string;
+  title: string;
+  filename: string;
+  vaultKey: string;
+  vaultPath: string;
+  width?: number | null;
+  height?: number | null;
+  thumbStatus: DbThumbStatus;
+}): Promise<number> {
+  return invoke<number>("finalize_item_import", {
+    input: {
+      itemId: input.itemId,
+      title: input.title,
+      filename: input.filename,
+      vaultKey: input.vaultKey,
+      vaultPath: input.vaultPath,
+      width: input.width ?? null,
+      height: input.height ?? null,
+      thumbStatus: input.thumbStatus,
+    },
+  });
+}
+
+export async function markDbItemImportError(itemId: string): Promise<number> {
+  return invoke<number>("mark_item_import_error", {
+    input: {
+      itemId,
+    },
+  });
+}

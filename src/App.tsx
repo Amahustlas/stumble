@@ -37,6 +37,7 @@ import {
   DedupeAsyncQueue,
   ensureThumbsRoot,
   fileExists,
+  THUMB_CONCURRENCY,
   THUMB_MAX_SIZE,
   ThumbnailQueue,
 } from "./lib/thumbs";
@@ -91,6 +92,7 @@ const THUMB_SKIP_MAX_DIMENSION = 640;
 const THUMB_JOB_TIMEOUT_MS = 60_000;
 const THUMB_JOB_MAX_RETRIES = 1;
 const THUMB_QUEUE_START_DELAY_MS = 700;
+const USER_INTERACTION_IDLE_MS = 600;
 const IMPORT_QUEUE_CONCURRENCY = 1;
 
 function createItemId(): string {
@@ -589,13 +591,15 @@ function App() {
   const filePickerInputRef = useRef<HTMLInputElement | null>(null);
   const thumbsRootRef = useRef<string | null>(null);
   const thumbnailQueueRef = useRef<ThumbnailQueue>(
-    new ThumbnailQueue(1, THUMB_QUEUE_START_DELAY_MS),
+    new ThumbnailQueue(THUMB_CONCURRENCY, THUMB_QUEUE_START_DELAY_MS),
   );
   const importQueueRef = useRef<DedupeAsyncQueue>(new DedupeAsyncQueue(IMPORT_QUEUE_CONCURRENCY));
   const importSourceByItemIdRef = useRef<Map<string, ImportSource>>(new Map());
   const transientPreviewUrlByItemIdRef = useRef<Map<string, string>>(new Map());
   const imageEvaluationQueueRef = useRef<DedupeAsyncQueue>(new DedupeAsyncQueue(1));
   const imageThumbnailEvaluationRequestedRef = useRef<Set<string>>(new Set());
+  const isUserInteractingRef = useRef(false);
+  const userInteractionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isUnmountedRef = useRef(false);
   const itemsRef = useRef<Item[]>(initialItems);
   const descriptionDraftByItemIdRef = useRef<Map<string, string>>(new Map());
@@ -1538,7 +1542,7 @@ function App() {
 
   useEffect(() => {
     isUnmountedRef.current = false;
-    thumbnailQueueRef.current = new ThumbnailQueue(1, THUMB_QUEUE_START_DELAY_MS);
+    thumbnailQueueRef.current = new ThumbnailQueue(THUMB_CONCURRENCY, THUMB_QUEUE_START_DELAY_MS);
     importQueueRef.current = new DedupeAsyncQueue(IMPORT_QUEUE_CONCURRENCY);
     importSourceByItemIdRef.current.clear();
     transientPreviewUrlByItemIdRef.current.clear();
@@ -1557,6 +1561,50 @@ function App() {
       importSourceByItemIdRef.current.clear();
       imageEvaluationQueueRef.current.dispose();
       imageThumbnailEvaluationRequestedRef.current.clear();
+      if (userInteractionTimeoutRef.current !== null) {
+        window.clearTimeout(userInteractionTimeoutRef.current);
+        userInteractionTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const markUserInteracting = () => {
+      if (!isUserInteractingRef.current) {
+        isUserInteractingRef.current = true;
+        thumbnailQueueRef.current.setConcurrency(1);
+      }
+
+      if (userInteractionTimeoutRef.current !== null) {
+        window.clearTimeout(userInteractionTimeoutRef.current);
+      }
+
+      userInteractionTimeoutRef.current = window.setTimeout(() => {
+        userInteractionTimeoutRef.current = null;
+        isUserInteractingRef.current = false;
+        thumbnailQueueRef.current.setConcurrency(THUMB_CONCURRENCY);
+      }, USER_INTERACTION_IDLE_MS);
+    };
+
+    const passiveCaptureOptions: AddEventListenerOptions = { capture: true, passive: true };
+    window.addEventListener("scroll", markUserInteracting, passiveCaptureOptions);
+    window.addEventListener("wheel", markUserInteracting, passiveCaptureOptions);
+    window.addEventListener("pointerdown", markUserInteracting, passiveCaptureOptions);
+    window.addEventListener("keydown", markUserInteracting, true);
+    window.addEventListener("dragover", markUserInteracting, true);
+
+    return () => {
+      window.removeEventListener("scroll", markUserInteracting, true);
+      window.removeEventListener("wheel", markUserInteracting, true);
+      window.removeEventListener("pointerdown", markUserInteracting, true);
+      window.removeEventListener("keydown", markUserInteracting, true);
+      window.removeEventListener("dragover", markUserInteracting, true);
+      if (userInteractionTimeoutRef.current !== null) {
+        window.clearTimeout(userInteractionTimeoutRef.current);
+        userInteractionTimeoutRef.current = null;
+      }
+      isUserInteractingRef.current = false;
+      thumbnailQueueRef.current.setConcurrency(THUMB_CONCURRENCY);
     };
   }, []);
 

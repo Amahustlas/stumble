@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export const THUMB_MAX_SIZE = 480;
+export const THUMB_CONCURRENCY = 2;
+export const THUMB_THROTTLE_MS = 50;
 
 export function buildThumbnailPath(thumbsRoot: string, vaultKey: string): string {
   const normalizedRoot = thumbsRoot.trim().replace(/[\\/]+$/, "");
@@ -57,6 +59,7 @@ type AsyncTask = {
 const DEFAULT_THUMBNAIL_TIMEOUT_MS = 60_000;
 const DEFAULT_THUMBNAIL_MAX_RETRIES = 1;
 const DEFAULT_THUMBNAIL_QUEUE_START_DELAY_MS = 400;
+const MAX_THUMB_CONCURRENCY = 3;
 
 class ThumbnailTimeoutError extends Error {
   readonly timeoutMs: number;
@@ -98,6 +101,19 @@ function normalizeNonNegativeInt(value: number | undefined, fallback: number): n
   return Math.max(0, Math.floor(value));
 }
 
+function normalizeThumbConcurrency(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return THUMB_CONCURRENCY;
+  }
+  return Math.min(MAX_THUMB_CONCURRENCY, Math.max(1, Math.floor(value)));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timeoutId = setTimeout(() => {
@@ -136,11 +152,22 @@ export class ThumbnailQueue {
   private activeCount = 0;
   private disposed = false;
   private delayedPumpTimerId: ReturnType<typeof setTimeout> | null = null;
+  private concurrency: number;
+  private readonly startDelayMs: number;
+  private readonly throttleMs: number;
 
   constructor(
-    private readonly concurrency = 2,
-    private readonly startDelayMs = DEFAULT_THUMBNAIL_QUEUE_START_DELAY_MS,
-  ) {}
+    concurrency = THUMB_CONCURRENCY,
+    startDelayMs = DEFAULT_THUMBNAIL_QUEUE_START_DELAY_MS,
+    throttleMs = THUMB_THROTTLE_MS,
+  ) {
+    this.concurrency = normalizeThumbConcurrency(concurrency);
+    this.startDelayMs = normalizeNonNegativeInt(
+      startDelayMs,
+      DEFAULT_THUMBNAIL_QUEUE_START_DELAY_MS,
+    );
+    this.throttleMs = normalizeNonNegativeInt(throttleMs, THUMB_THROTTLE_MS);
+  }
 
   enqueue(task: ThumbnailTask): void {
     if (this.disposed) {
@@ -167,6 +194,18 @@ export class ThumbnailQueue {
     }
     this.pendingByKey.clear();
     this.activeKeys.clear();
+  }
+
+  setConcurrency(nextConcurrency: number): void {
+    if (this.disposed) {
+      return;
+    }
+    const normalizedConcurrency = normalizeThumbConcurrency(nextConcurrency);
+    if (normalizedConcurrency === this.concurrency) {
+      return;
+    }
+    this.concurrency = normalizedConcurrency;
+    this.schedulePump();
   }
 
   private schedulePump(): void {
@@ -300,7 +339,7 @@ export class ThumbnailQueue {
           });
           task.onError?.(error);
         })
-        .finally(() => {
+        .finally(async () => {
           if (!this.disposed) {
             this.activeKeys.delete(dedupeKey);
           }
@@ -308,6 +347,9 @@ export class ThumbnailQueue {
           console.log("[thumb-queue] queue length", {
             queueLength: this.pendingByKey.size + this.activeCount,
           });
+          if (this.throttleMs > 0) {
+            await sleep(this.throttleMs);
+          }
           this.pump();
         });
     }

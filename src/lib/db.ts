@@ -4,8 +4,22 @@ export type DbCollectionRecord = {
   id: string;
   parentId: string | null;
   name: string;
+  description: string | null;
+  icon: string;
   color: string;
   createdAt: number;
+  updatedAt: number;
+};
+
+export interface Collection {
+  id: string;
+  name: string;
+  description?: string;
+  icon: string;
+  color: string;
+  parentId?: string | null;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type DbThumbStatus = "ready" | "pending" | "skipped" | "error";
@@ -72,12 +86,55 @@ export type DbUpdateItemsCollectionResult = {
   updatedAt: number;
 };
 
+function toCollection(record: DbCollectionRecord): Collection {
+  return {
+    id: record.id,
+    name: record.name,
+    description: record.description ?? undefined,
+    icon: record.icon,
+    color: record.color,
+    parentId: record.parentId ?? null,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
 export async function initDb(): Promise<string> {
   return invoke<string>("init_db");
 }
 
 export async function loadDbAppState(): Promise<DbAppState> {
   return invoke<DbAppState>("load_app_state");
+}
+
+export async function createCollection(params: {
+  name: string;
+  parentId?: string | null;
+  icon: string;
+  color: string;
+  description?: string;
+}): Promise<Collection> {
+  const row = await invoke<DbCollectionRecord>("create_collection", {
+    name: params.name,
+    parentId: params.parentId ?? null,
+    icon: params.icon,
+    color: params.color,
+    description: params.description ?? null,
+  });
+  return toCollection(row);
+}
+
+export async function getAllCollections(): Promise<Collection[]> {
+  const rows = await invoke<DbCollectionRecord[]>("get_all_collections");
+  return rows.map(toCollection);
+}
+
+export async function deleteCollection(id: string): Promise<number> {
+  return invoke<number>("delete_collection", { id });
+}
+
+export async function updateCollectionName(id: string, name: string): Promise<number> {
+  return invoke<number>("update_collection_name", { id, name });
 }
 
 export async function insertDbItem(item: DbInsertItemInput): Promise<void> {

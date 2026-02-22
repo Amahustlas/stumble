@@ -10,10 +10,16 @@ import Topbar from "./components/Topbar";
 import {
   initDb,
   loadDbAppState,
-  type DbCollectionRecord,
+  type Collection,
   type DbInsertItemInput,
   type DbItemRecord,
 } from "./lib/db";
+import {
+  createCollection as createCollectionInDb,
+  deleteCollection as deleteCollectionInDb,
+  getAllCollections as getAllCollectionsInDb,
+  updateCollectionName as updateCollectionNameInDb,
+} from "./lib/repositories/collectionsRepo";
 import {
   deleteItemsByIdsWithCleanup as deleteItemsByIdsWithCleanupInDb,
   finalizeItemImport as finalizeItemImportInDb,
@@ -41,6 +47,12 @@ import {
   THUMB_MAX_SIZE,
   ThumbnailQueue,
 } from "./lib/thumbs";
+import {
+  buildCollectionPathMap,
+  buildCollectionTree,
+  collectCollectionSubtreeIds,
+  type CollectionTreeNode,
+} from "./lib/collections";
 
 export type ItemType = "bookmark" | "image" | "video" | "pdf" | "file" | "note";
 export type ThumbStatus = "ready" | "pending" | "skipped" | "error";
@@ -77,13 +89,6 @@ export type Item = {
   sourceUrl?: string;
 };
 
-export type CollectionNode = {
-  id: string;
-  name: string;
-  color: string;
-  children?: CollectionNode[];
-};
-
 const initialItems: Item[] = [];
 
 const IMAGE_EXTENSIONS = /\.(png|jpe?g|webp|gif|bmp|svg)$/i;
@@ -94,6 +99,24 @@ const THUMB_JOB_MAX_RETRIES = 1;
 const THUMB_QUEUE_START_DELAY_MS = 700;
 const USER_INTERACTION_IDLE_MS = 600;
 const IMPORT_QUEUE_CONCURRENCY = 1;
+const DEFAULT_COLLECTION_ICON = "folder";
+const DEFAULT_COLLECTION_COLOR = "#8B8B8B";
+const DEFAULT_COLLECTION_NAME = "New Collection";
+
+function nextCollectionName(collections: Collection[]): string {
+  const normalizedNames = new Set(
+    collections.map((collection) => collection.name.trim().toLowerCase()),
+  );
+  if (!normalizedNames.has(DEFAULT_COLLECTION_NAME.toLowerCase())) {
+    return DEFAULT_COLLECTION_NAME;
+  }
+
+  let suffix = 2;
+  while (normalizedNames.has(`${DEFAULT_COLLECTION_NAME.toLowerCase()} ${suffix}`)) {
+    suffix += 1;
+  }
+  return `${DEFAULT_COLLECTION_NAME} ${suffix}`;
+}
 
 function createItemId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -227,88 +250,6 @@ function shouldSkipThumbnailGeneration(args: {
   const { width, height } = args;
   const hasDimensions = typeof width === "number" && typeof height === "number";
   return hasDimensions && Math.max(width, height) <= THUMB_SKIP_MAX_DIMENSION;
-}
-
-function buildCollectionTree(collections: DbCollectionRecord[]): CollectionNode[] {
-  const byId = new Map<
-    string,
-    {
-      node: CollectionNode;
-      parentId: string | null;
-      createdAt: number;
-    }
-  >();
-
-  collections.forEach((collection) => {
-    byId.set(collection.id, {
-      node: {
-        id: collection.id,
-        name: collection.name,
-        color: collection.color,
-        children: [],
-      },
-      parentId: collection.parentId,
-      createdAt: collection.createdAt,
-    });
-  });
-
-  const roots: Array<{ node: CollectionNode; createdAt: number }> = [];
-
-  byId.forEach(({ node, parentId, createdAt }) => {
-    if (parentId && byId.has(parentId)) {
-      byId.get(parentId)!.node.children!.push(node);
-      return;
-    }
-    roots.push({ node, createdAt });
-  });
-
-  const sortNodes = (nodes: CollectionNode[]) => {
-    nodes.sort((a, b) => a.name.localeCompare(b.name));
-    nodes.forEach((node) => {
-      if (node.children?.length) {
-        sortNodes(node.children);
-      }
-      if (!node.children?.length) {
-        node.children = undefined;
-      }
-    });
-  };
-
-  sortNodes(roots.map((entry) => entry.node));
-
-  return roots
-    .sort((a, b) => a.createdAt - b.createdAt)
-    .map((entry) => entry.node);
-}
-
-function buildCollectionPathMap(collections: DbCollectionRecord[]): Map<string, string> {
-  const byId = new Map(collections.map((collection) => [collection.id, collection]));
-  const cache = new Map<string, string>();
-
-  const resolvePath = (id: string, seen: Set<string>): string => {
-    const cached = cache.get(id);
-    if (cached) return cached;
-
-    const collection = byId.get(id);
-    if (!collection) return "All Items";
-
-    if (!collection.parentId || !byId.has(collection.parentId) || seen.has(id)) {
-      cache.set(id, collection.name);
-      return collection.name;
-    }
-
-    seen.add(id);
-    const parentPath = resolvePath(collection.parentId, seen);
-    const fullPath = `${parentPath}/${collection.name}`;
-    cache.set(id, fullPath);
-    return fullPath;
-  };
-
-  collections.forEach((collection) => {
-    resolvePath(collection.id, new Set<string>());
-  });
-
-  return cache;
 }
 
 function yieldToMainThread(): Promise<void> {
@@ -565,7 +506,7 @@ function mapDbItemToItem(args: {
 }
 
 function App() {
-  const [collections, setCollections] = useState<DbCollectionRecord[]>([]);
+  const [collections, setCollections] = useState<Collection[]>([]);
   const [items, setItems] = useState<Item[]>(initialItems);
   const [searchQuery, setSearchQuery] = useState("");
   const [tileSize, setTileSize] = useState(220);
@@ -575,7 +516,7 @@ function App() {
   const [deleteConfirmItemIds, setDeleteConfirmItemIds] = useState<string[]>([]);
   const [moveTargetItemIds, setMoveTargetItemIds] = useState<string[]>([]);
   const [isActionInProgress, setIsActionInProgress] = useState(false);
-  const [activeCollectionId, setActiveCollectionId] = useState<string | null>(null);
+  const [selectedCollectionId, setSelectedCollectionId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{
     open: boolean;
     x: number;
@@ -616,14 +557,109 @@ function App() {
     [collections],
   );
 
-  const activeCollectionPath =
-    activeCollectionId !== null
-      ? collectionPathById.get(activeCollectionId) ?? "All Items"
+  const selectedCollectionPath =
+    selectedCollectionId !== null
+      ? collectionPathById.get(selectedCollectionId) ?? "All Items"
       : "All Items";
+
+  const createCollection = useCallback(
+    async (parentId: string | null): Promise<Collection | null> => {
+      const generatedName = nextCollectionName(collections);
+      try {
+        const createdCollection = await createCollectionInDb({
+          name: generatedName,
+          parentId,
+          icon: DEFAULT_COLLECTION_ICON,
+          color: DEFAULT_COLLECTION_COLOR,
+          description: "",
+        });
+        setCollections((currentCollections) => [...currentCollections, createdCollection]);
+        setSelectedCollectionId(createdCollection.id);
+        return createdCollection;
+      } catch (error) {
+        console.error("Failed to create collection:", error);
+        return null;
+      }
+    },
+    [collections],
+  );
+
+  const renameCollection = useCallback(async (id: string, newName: string): Promise<boolean> => {
+    const trimmedName = newName.trim();
+    if (trimmedName.length === 0) {
+      return false;
+    }
+    try {
+      const updatedAt = await updateCollectionNameInDb(id, trimmedName);
+      setCollections((currentCollections) =>
+        currentCollections.map((collection) =>
+          collection.id === id ? { ...collection, name: trimmedName, updatedAt } : collection,
+        ),
+      );
+      return true;
+    } catch (error) {
+      console.error("Failed to rename collection:", error);
+      return false;
+    }
+  }, []);
+
+  const deleteCollection = useCallback(
+    async (id: string): Promise<void> => {
+      const targetCollection = collections.find((collection) => collection.id === id);
+      const deletedSubtreeIds = collectCollectionSubtreeIds(collections, id);
+      try {
+        await deleteCollectionInDb(id);
+        const refreshedCollections = await getAllCollectionsInDb();
+        setCollections(refreshedCollections);
+        setSelectedCollectionId((currentSelectedCollectionId) => {
+          if (!currentSelectedCollectionId) return currentSelectedCollectionId;
+          if (!deletedSubtreeIds.has(currentSelectedCollectionId)) {
+            return currentSelectedCollectionId;
+          }
+
+          const fallbackParentId = targetCollection?.parentId ?? null;
+          if (
+            fallbackParentId &&
+            refreshedCollections.some((collection) => collection.id === fallbackParentId)
+          ) {
+            return fallbackParentId;
+          }
+          return null;
+        });
+      } catch (error) {
+        console.error("Failed to delete collection:", error);
+      }
+    },
+    [collections],
+  );
 
   useEffect(() => {
     itemsRef.current = items;
   }, [items]);
+
+  useEffect(() => {
+    if (!selectedCollectionId) return;
+    if (collections.some((collection) => collection.id === selectedCollectionId)) return;
+    setSelectedCollectionId(null);
+  }, [collections, selectedCollectionId]);
+
+  useEffect(() => {
+    setItems((currentItems) => {
+      let hasChanges = false;
+      const nextItems = currentItems.map((item) => {
+        const nextCollectionPath =
+          item.collectionId !== null
+            ? collectionPathById.get(item.collectionId) ?? "All Items"
+            : "All Items";
+        if (item.collectionPath === nextCollectionPath) {
+          return item;
+        }
+        hasChanges = true;
+        return { ...item, collectionPath: nextCollectionPath };
+      });
+      return hasChanges ? nextItems : currentItems;
+    });
+  }, [collectionPathById]);
 
   useEffect(() => {
     const validIds = new Set(items.map((item) => item.id));
@@ -1358,8 +1394,8 @@ function App() {
         return createImportPlaceholderItem({
           filename: source.filename,
           type: source.type,
-          collectionId: activeCollectionId,
-          collectionPath: activeCollectionPath,
+          collectionId: selectedCollectionId,
+          collectionPath: selectedCollectionPath,
           previewUrl,
         });
       });
@@ -1414,7 +1450,7 @@ function App() {
         enqueueImportJob(item.id);
       });
     },
-    [activeCollectionId, activeCollectionPath, enqueueImportJob],
+    [selectedCollectionId, selectedCollectionPath, enqueueImportJob],
   );
 
   const importPathsToVault = useCallback(
@@ -1471,10 +1507,13 @@ function App() {
         console.log("Thumbnail root ready:", thumbsRoot);
         console.log("SQLite database ready:", dbFilePath);
 
-        const persistedState = await loadDbAppState();
+        const [persistedState, loadedCollections] = await Promise.all([
+          loadDbAppState(),
+          getAllCollectionsInDb(),
+        ]);
         if (!isMounted) return;
 
-        const collectionRows = persistedState.collections;
+        const collectionRows = loadedCollections;
         const pathById = buildCollectionPathMap(collectionRows);
         const mappedItems = persistedState.items.map((item) =>
           mapDbItemToItem({
@@ -1779,9 +1818,9 @@ function App() {
   }, [queueImportSources]);
 
   const scopedItems = useMemo(() => {
-    if (!activeCollectionId) return items;
-    return items.filter((item) => item.collectionId === activeCollectionId);
-  }, [items, activeCollectionId]);
+    if (!selectedCollectionId) return items;
+    return items.filter((item) => item.collectionId === selectedCollectionId);
+  }, [items, selectedCollectionId]);
 
   const tags = useMemo(() => {
     const uniqueTags = new Set<string>();
@@ -2033,27 +2072,30 @@ function App() {
     return collectionIds;
   }, [items, moveTargetItemIds]);
 
-  const renderMoveCollectionButtons = (nodes: CollectionNode[], level = 0): React.ReactNode =>
+  const renderMoveCollectionButtons = (
+    nodes: CollectionTreeNode[],
+    level = 0,
+  ): React.ReactNode =>
     nodes.map((node) => (
-      <div key={node.id}>
+      <div key={node.collection.id}>
         <button
           type="button"
-          className={`move-collection-button ${moveTargetCollectionIds.has(node.id) ? "active" : ""}`}
+          className={`move-collection-button ${moveTargetCollectionIds.has(node.collection.id) ? "active" : ""}`}
           style={{ paddingLeft: `${12 + level * 16}px` }}
           onClick={() => {
-            void moveSelectedItemsToCollection(node.id);
+            void moveSelectedItemsToCollection(node.collection.id);
           }}
           disabled={isActionInProgress}
         >
           <span className="move-collection-node-icon">#</span>
           <span
             className="collection-color"
-            style={{ backgroundColor: node.color }}
+            style={{ backgroundColor: node.collection.color }}
             aria-hidden="true"
           />
-          <span>{node.name}</span>
+          <span>{node.collection.name}</span>
         </button>
-        {node.children && node.children.length > 0
+        {node.children.length > 0
           ? renderMoveCollectionButtons(node.children, level + 1)
           : null}
       </div>
@@ -2064,8 +2106,11 @@ function App() {
       <Sidebar
         collections={collectionTree}
         tags={tags}
-        activeCollectionId={activeCollectionId}
-        onSelectCollection={setActiveCollectionId}
+        selectedCollectionId={selectedCollectionId}
+        onSelectCollection={setSelectedCollectionId}
+        onCreateCollection={createCollection}
+        onRenameCollection={renameCollection}
+        onDeleteCollection={deleteCollection}
       />
 
       <section className="content-layout">

@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use uuid::Uuid;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +25,7 @@ struct VaultImportResult {
 
 const DEFAULT_ROOT_COLLECTION_ID: &str = "root";
 const DEFAULT_ROOT_COLLECTION_NAME: &str = "Root";
+const DEFAULT_ROOT_COLLECTION_ICON: &str = "folder";
 const DEFAULT_ROOT_COLLECTION_COLOR: &str = "#60a5fa";
 const DEFAULT_THUMB_STATUS: &str = "pending";
 const DEFAULT_IMPORT_STATUS: &str = "ready";
@@ -36,8 +38,11 @@ struct DbCollectionRow {
     id: String,
     parent_id: Option<String>,
     name: String,
+    description: Option<String>,
+    icon: String,
     color: String,
     created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Serialize)]
@@ -217,10 +222,13 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
             r#"
             CREATE TABLE IF NOT EXISTS collections (
                 id TEXT PRIMARY KEY,
-                parent_id TEXT NULL,
                 name TEXT NOT NULL,
+                description TEXT NULL,
+                icon TEXT NOT NULL,
                 color TEXT NOT NULL,
+                parent_id TEXT NULL,
                 created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
                 FOREIGN KEY (parent_id) REFERENCES collections(id) ON DELETE SET NULL
             );
 
@@ -241,6 +249,17 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collection_items (
+                id TEXT PRIMARY KEY,
+                collection_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                custom_title TEXT NULL,
+                custom_description TEXT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS tags (
@@ -272,6 +291,7 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|err| format!("failed to run sqlite migrations: {}", err))?;
     ensure_items_status_columns(connection)?;
+    ensure_collections_columns(connection)?;
     Ok(())
 }
 
@@ -336,6 +356,68 @@ fn ensure_items_status_columns(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_collections_columns(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare("PRAGMA table_info(collections)")
+        .map_err(|err| format!("failed to inspect collections table info: {}", err))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to read collections table info: {}", err))?;
+
+    let mut has_description = false;
+    let mut has_icon = false;
+    let mut has_updated_at = false;
+
+    for row_result in rows {
+        let column_name =
+            row_result.map_err(|err| format!("failed to parse collections table column: {}", err))?;
+        if column_name == "description" {
+            has_description = true;
+        }
+        if column_name == "icon" {
+            has_icon = true;
+        }
+        if column_name == "updated_at" {
+            has_updated_at = true;
+        }
+    }
+
+    if !has_description {
+        connection
+            .execute("ALTER TABLE collections ADD COLUMN description TEXT NULL", [])
+            .map_err(|err| format!("failed to add collections.description column: {}", err))?;
+    }
+
+    if !has_icon {
+        connection
+            .execute(
+                "ALTER TABLE collections ADD COLUMN icon TEXT NOT NULL DEFAULT 'folder'",
+                [],
+            )
+            .map_err(|err| format!("failed to add collections.icon column: {}", err))?;
+    }
+
+    if !has_updated_at {
+        connection
+            .execute(
+                "ALTER TABLE collections ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|err| format!("failed to add collections.updated_at column: {}", err))?;
+    }
+
+    connection
+        .execute(
+            "UPDATE collections
+             SET updated_at = created_at
+             WHERE updated_at = 0",
+            [],
+        )
+        .map_err(|err| format!("failed to backfill collections.updated_at values: {}", err))?;
+
+    Ok(())
+}
+
 fn ensure_default_root_collection(connection: &Connection) -> Result<(), String> {
     let collection_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM collections", [], |row| row.get(0))
@@ -345,10 +427,20 @@ fn ensure_default_root_collection(connection: &Connection) -> Result<(), String>
         let now = Utc::now().timestamp_millis();
         connection
             .execute(
-                "INSERT INTO collections (id, parent_id, name, color, created_at) VALUES (?1, NULL, ?2, ?3, ?4)",
+                "INSERT INTO collections (
+                    id,
+                    name,
+                    description,
+                    icon,
+                    color,
+                    parent_id,
+                    created_at,
+                    updated_at
+                ) VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, ?5)",
                 params![
                     DEFAULT_ROOT_COLLECTION_ID,
                     DEFAULT_ROOT_COLLECTION_NAME,
+                    DEFAULT_ROOT_COLLECTION_ICON,
                     DEFAULT_ROOT_COLLECTION_COLOR,
                     now
                 ],
@@ -1182,7 +1274,15 @@ fn load_app_state() -> Result<DbAppState, String> {
 
     let mut collections_stmt = connection
         .prepare(
-            "SELECT id, parent_id, name, color, created_at
+            "SELECT
+                id,
+                parent_id,
+                name,
+                description,
+                icon,
+                color,
+                created_at,
+                updated_at
              FROM collections
              ORDER BY created_at ASC",
         )
@@ -1194,8 +1294,11 @@ fn load_app_state() -> Result<DbAppState, String> {
                 id: row.get(0)?,
                 parent_id: row.get(1)?,
                 name: row.get(2)?,
-                color: row.get(3)?,
-                created_at: row.get(4)?,
+                description: row.get(3)?,
+                icon: row.get(4)?,
+                color: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })
         .map_err(|err| format!("failed to query collections: {}", err))?;
@@ -1269,6 +1372,248 @@ fn load_app_state() -> Result<DbAppState, String> {
     }
 
     Ok(DbAppState { collections, items })
+}
+
+#[tauri::command]
+fn create_collection(
+    name: String,
+    parent_id: Option<String>,
+    icon: String,
+    color: String,
+    description: Option<String>,
+) -> Result<DbCollectionRow, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+
+    let normalized_name = name.trim().to_string();
+    if normalized_name.is_empty() {
+        return Err("collection name cannot be empty".to_string());
+    }
+
+    let normalized_icon = icon.trim().to_string();
+    if normalized_icon.is_empty() {
+        return Err("collection icon cannot be empty".to_string());
+    }
+
+    let normalized_color = color.trim().to_string();
+    if normalized_color.is_empty() {
+        return Err("collection color cannot be empty".to_string());
+    }
+
+    let normalized_parent_id = parent_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(parent_collection_id) = normalized_parent_id.as_deref() {
+        let parent_exists = connection
+            .query_row(
+                "SELECT 1 FROM collections WHERE id = ?1",
+                params![parent_collection_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to validate parent collection: {}", err))?;
+        if parent_exists.is_none() {
+            return Err("parent collection not found".to_string());
+        }
+    }
+
+    let normalized_description = description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let now = Utc::now().timestamp_millis();
+    let collection_id = Uuid::new_v4().to_string();
+    connection
+        .execute(
+            "INSERT INTO collections (
+                id,
+                name,
+                description,
+                icon,
+                color,
+                parent_id,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                &collection_id,
+                &normalized_name,
+                normalized_description.as_deref(),
+                &normalized_icon,
+                &normalized_color,
+                normalized_parent_id.as_deref(),
+                now
+            ],
+        )
+        .map_err(|err| format!("failed to create collection: {}", err))?;
+
+    Ok(DbCollectionRow {
+        id: collection_id,
+        parent_id: normalized_parent_id,
+        name: normalized_name,
+        description: normalized_description,
+        icon: normalized_icon,
+        color: normalized_color,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+#[tauri::command]
+fn get_all_collections() -> Result<Vec<DbCollectionRow>, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+
+    let mut stmt = connection
+        .prepare(
+            "SELECT
+                id,
+                parent_id,
+                name,
+                description,
+                icon,
+                color,
+                created_at,
+                updated_at
+             FROM collections
+             ORDER BY created_at ASC",
+        )
+        .map_err(|err| format!("failed to prepare all collections query: {}", err))?;
+
+    let row_iter = stmt
+        .query_map([], |row| {
+            Ok(DbCollectionRow {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                icon: row.get(4)?,
+                color: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })
+        .map_err(|err| format!("failed to query all collections: {}", err))?;
+
+    let mut collections = Vec::new();
+    for row_result in row_iter {
+        collections.push(
+            row_result.map_err(|err| format!("failed to read collection row: {}", err))?,
+        );
+    }
+
+    Ok(collections)
+}
+
+#[tauri::command]
+fn update_collection_name(id: String, name: String) -> Result<i64, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+
+    let normalized_name = name.trim().to_string();
+    if normalized_name.is_empty() {
+        return Err("collection name cannot be empty".to_string());
+    }
+
+    let updated_at = Utc::now().timestamp_millis();
+    let updated_rows = connection
+        .execute(
+            "UPDATE collections
+             SET name = ?1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![normalized_name, updated_at, id],
+        )
+        .map_err(|err| format!("failed to update collection name: {}", err))?;
+
+    if updated_rows == 0 {
+        return Err("collection not found while updating name".to_string());
+    }
+
+    Ok(updated_at)
+}
+
+fn load_child_collection_ids_in_tx(
+    transaction: &Transaction<'_>,
+    parent_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut stmt = transaction
+        .prepare("SELECT id FROM collections WHERE parent_id = ?1")
+        .map_err(|err| format!("failed to prepare child collection query: {}", err))?;
+    let row_iter = stmt
+        .query_map(params![parent_id], |row| row.get::<_, String>(0))
+        .map_err(|err| format!("failed to query child collections: {}", err))?;
+
+    let mut child_ids = Vec::new();
+    for row_result in row_iter {
+        child_ids
+            .push(row_result.map_err(|err| format!("failed to read child collection row: {}", err))?);
+    }
+    Ok(child_ids)
+}
+
+fn collect_collection_subtree_ids_in_tx(
+    transaction: &Transaction<'_>,
+    root_collection_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut stack = vec![root_collection_id.to_string()];
+    let mut visited_ids = BTreeSet::new();
+    let mut collected_ids = Vec::new();
+
+    while let Some(collection_id) = stack.pop() {
+        if !visited_ids.insert(collection_id.clone()) {
+            continue;
+        }
+
+        collected_ids.push(collection_id.clone());
+        let child_ids = load_child_collection_ids_in_tx(transaction, &collection_id)?;
+        for child_id in child_ids {
+            stack.push(child_id);
+        }
+    }
+
+    Ok(collected_ids)
+}
+
+#[tauri::command]
+fn delete_collection(id: String) -> Result<usize, String> {
+    initialize_db()?;
+    let trimmed_id = id.trim().to_string();
+    if trimmed_id.is_empty() {
+        return Err("collection id cannot be empty".to_string());
+    }
+
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM collections WHERE id = ?1",
+            params![&trimmed_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|err| format!("failed to verify collection before delete: {}", err))?;
+    if exists.is_none() {
+        return Ok(0);
+    }
+
+    let subtree_ids = collect_collection_subtree_ids_in_tx(&transaction, &trimmed_id)?;
+    let mut deleted_rows = 0usize;
+    for collection_id in subtree_ids.iter().rev() {
+        let affected = transaction
+            .execute("DELETE FROM collections WHERE id = ?1", params![collection_id])
+            .map_err(|err| format!("failed to delete collection row: {}", err))?;
+        deleted_rows += affected;
+    }
+
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit delete collection transaction: {}", err))?;
+
+    Ok(deleted_rows)
 }
 
 fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Result<(), String> {
@@ -1951,6 +2296,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             init_db,
             load_app_state,
+            create_collection,
+            get_all_collections,
+            update_collection_name,
+            delete_collection,
             insert_item,
             insert_items_batch,
             delete_items,

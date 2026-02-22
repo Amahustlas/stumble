@@ -24,6 +24,7 @@ export interface Collection {
 
 export type DbThumbStatus = "ready" | "pending" | "skipped" | "error";
 export type DbImportStatus = "ready" | "processing" | "error";
+export type DbMetaStatus = "ready" | "pending" | "error";
 
 export type DbItemRecord = {
   id: string;
@@ -38,6 +39,9 @@ export type DbItemRecord = {
   height: number | null;
   thumbStatus: DbThumbStatus;
   importStatus: DbImportStatus;
+  url: string | null;
+  faviconPath: string | null;
+  metaStatus: DbMetaStatus;
   description: string | null;
   createdAt: number;
   updatedAt: number;
@@ -62,6 +66,9 @@ export type DbInsertItemInput = {
   height: number | null;
   thumbStatus: DbThumbStatus;
   importStatus: DbImportStatus;
+  url: string | null;
+  faviconPath: string | null;
+  metaStatus: DbMetaStatus;
   description: string | null;
   createdAt: number;
   updatedAt: number;
@@ -184,6 +191,26 @@ export async function updateDbItemMediaState(params: {
       width: params.width ?? null,
       height: params.height ?? null,
       thumbStatus: params.thumbStatus ?? null,
+    },
+  });
+}
+
+export async function updateDbItemBookmarkMetadata(input: {
+  itemId: string;
+  url?: string | null;
+  title?: string | null;
+  filename?: string | null;
+  faviconPath?: string | null;
+  metaStatus: DbMetaStatus;
+}): Promise<number> {
+  return invoke<number>("update_item_bookmark_metadata", {
+    input: {
+      itemId: input.itemId,
+      url: input.url ?? null,
+      title: input.title ?? null,
+      filename: input.filename ?? null,
+      faviconPath: input.faviconPath ?? null,
+      metaStatus: input.metaStatus,
     },
   });
 }

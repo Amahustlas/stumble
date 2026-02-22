@@ -10,7 +10,7 @@ type CollectionTreeProps = {
   onSelectCollection: (id: string) => void;
   onCreateCollection: (parentId: string | null) => Promise<Collection | null>;
   onRenameCollection: (id: string, name: string) => Promise<boolean>;
-  onDeleteCollection: (id: string) => Promise<void>;
+  onDeleteCollection: (id: string, name: string) => void;
 };
 
 type CollectionSnapshot = {
@@ -163,17 +163,11 @@ function CollectionTree({
 
   const handleDeleteCollection = useCallback(
     (id: string, name: string) => {
-      const isConfirmed = window.confirm(
-        `Delete collection "${name}"? This will also delete all subcollections.`,
-      );
-      if (!isConfirmed) {
-        return;
-      }
       if (editingCollectionId === id) {
         setEditingCollectionId(null);
         setEditingName("");
       }
-      void onDeleteCollection(id);
+      onDeleteCollection(id, name);
     },
     [editingCollectionId, onDeleteCollection],
   );

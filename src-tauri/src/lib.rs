@@ -1,7 +1,9 @@
 use chrono::{Datelike, Utc};
 use image::{imageops::FilterType, GenericImageView, ImageReader};
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rfd::FileDialog;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -9,7 +11,8 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use url::Url;
 use uuid::Uuid;
 
 #[derive(Serialize)]
@@ -29,8 +32,15 @@ const DEFAULT_ROOT_COLLECTION_ICON: &str = "folder";
 const DEFAULT_ROOT_COLLECTION_COLOR: &str = "#60a5fa";
 const DEFAULT_THUMB_STATUS: &str = "pending";
 const DEFAULT_IMPORT_STATUS: &str = "ready";
+const DEFAULT_META_STATUS: &str = "ready";
 const IMPORT_THUMB_MAX_SIZE: u32 = 480;
 const THUMB_WEBP_QUALITY: f32 = 60.0;
+const BOOKMARK_HTML_MAX_BYTES: usize = 1_500_000;
+const BOOKMARK_FAVICON_MAX_BYTES: usize = 512 * 1024;
+const BOOKMARK_FETCH_TIMEOUT_SECS: u64 = 7;
+const BOOKMARK_FETCH_RETRIES: usize = 1;
+const BOOKMARK_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Stumble/0.1 Safari/537.36";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +71,9 @@ struct DbItemRow {
     height: Option<i64>,
     thumb_status: String,
     import_status: String,
+    url: Option<String>,
+    favicon_path: Option<String>,
+    meta_status: String,
     description: Option<String>,
     created_at: i64,
     updated_at: i64,
@@ -90,6 +103,9 @@ struct InsertItemInput {
     height: Option<i64>,
     thumb_status: String,
     import_status: String,
+    url: Option<String>,
+    favicon_path: Option<String>,
+    meta_status: Option<String>,
     description: Option<String>,
     created_at: i64,
     updated_at: i64,
@@ -123,6 +139,17 @@ struct FinalizeItemImportInput {
 #[serde(rename_all = "camelCase")]
 struct MarkItemImportErrorInput {
     item_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateItemBookmarkMetadataInput {
+    item_id: String,
+    url: Option<String>,
+    title: Option<String>,
+    filename: Option<String>,
+    favicon_path: Option<String>,
+    meta_status: String,
 }
 
 #[derive(Serialize)]
@@ -174,6 +201,16 @@ struct ImportPipelineResult {
     thumb_status: String,
     thumb_path: Option<String>,
     metrics: ImportPipelineMetrics,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchBookmarkMetadataResult {
+    final_url: String,
+    title: Option<String>,
+    favicon_path: Option<String>,
+    favicon_ext: Option<String>,
+    favicon_url_candidate: Option<String>,
 }
 
 fn path_to_string(path: &Path) -> Result<String, String> {
@@ -245,6 +282,9 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
                 height INTEGER NULL,
                 thumb_status TEXT NOT NULL DEFAULT 'pending',
                 import_status TEXT NOT NULL DEFAULT 'ready',
+                url TEXT NULL,
+                favicon_path TEXT NULL,
+                meta_status TEXT NOT NULL DEFAULT 'ready',
                 description TEXT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -291,6 +331,7 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|err| format!("failed to run sqlite migrations: {}", err))?;
     ensure_items_status_columns(connection)?;
+    ensure_items_bookmark_columns(connection)?;
     ensure_collections_columns(connection)?;
     Ok(())
 }
@@ -311,6 +352,15 @@ fn normalize_import_status(value: &str) -> String {
         "processing" => "processing".to_string(),
         "error" => "error".to_string(),
         _ => DEFAULT_IMPORT_STATUS.to_string(),
+    }
+}
+
+fn normalize_meta_status(value: &str) -> String {
+    match value.trim() {
+        "ready" => "ready".to_string(),
+        "pending" => "pending".to_string(),
+        "error" => "error".to_string(),
+        _ => DEFAULT_META_STATUS.to_string(),
     }
 }
 
@@ -352,6 +402,69 @@ fn ensure_items_status_columns(connection: &Connection) -> Result<(), String> {
             )
             .map_err(|err| format!("failed to add items.import_status column: {}", err))?;
     }
+
+    Ok(())
+}
+
+fn ensure_items_bookmark_columns(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare("PRAGMA table_info(items)")
+        .map_err(|err| format!("failed to inspect items table info for bookmark columns: {}", err))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to read items table info for bookmark columns: {}", err))?;
+
+    let mut has_url = false;
+    let mut has_favicon_path = false;
+    let mut has_meta_status = false;
+    for row_result in rows {
+        let column_name = row_result
+            .map_err(|err| format!("failed to parse items table column for bookmarks: {}", err))?;
+        if column_name == "url" {
+            has_url = true;
+        }
+        if column_name == "favicon_path" {
+            has_favicon_path = true;
+        }
+        if column_name == "meta_status" {
+            has_meta_status = true;
+        }
+    }
+
+    if !has_url {
+        connection
+            .execute("ALTER TABLE items ADD COLUMN url TEXT NULL", [])
+            .map_err(|err| format!("failed to add items.url column: {}", err))?;
+    }
+
+    if !has_favicon_path {
+        connection
+            .execute("ALTER TABLE items ADD COLUMN favicon_path TEXT NULL", [])
+            .map_err(|err| format!("failed to add items.favicon_path column: {}", err))?;
+    }
+
+    if !has_meta_status {
+        connection
+            .execute(
+                "ALTER TABLE items ADD COLUMN meta_status TEXT NOT NULL DEFAULT 'ready'",
+                [],
+            )
+            .map_err(|err| format!("failed to add items.meta_status column: {}", err))?;
+    }
+
+    connection
+        .execute(
+            "UPDATE items
+             SET meta_status = CASE
+                 WHEN type = 'bookmark'
+                      AND (url IS NULL OR TRIM(url) = '')
+                 THEN 'error'
+                 ELSE 'ready'
+             END
+             WHERE meta_status IS NULL OR TRIM(meta_status) = ''",
+            [],
+        )
+        .map_err(|err| format!("failed to backfill items.meta_status values: {}", err))?;
 
     Ok(())
 }
@@ -499,6 +612,10 @@ fn thumbs_root_path() -> Result<PathBuf, String> {
     Ok(app_root_path()?.join("thumbs"))
 }
 
+fn favicons_root_path() -> Result<PathBuf, String> {
+    Ok(app_root_path()?.join("favicons"))
+}
+
 fn ensure_storage_root_internal() -> Result<PathBuf, String> {
     let root = storage_root_path()?;
     fs::create_dir_all(&root)
@@ -510,6 +627,13 @@ fn ensure_thumbs_root_internal() -> Result<PathBuf, String> {
     let root = thumbs_root_path()?;
     fs::create_dir_all(&root)
         .map_err(|err| format!("failed to create thumbs root {}: {}", root.display(), err))?;
+    Ok(root)
+}
+
+fn ensure_favicons_root_internal() -> Result<PathBuf, String> {
+    let root = favicons_root_path()?;
+    fs::create_dir_all(&root)
+        .map_err(|err| format!("failed to create favicons root {}: {}", root.display(), err))?;
     Ok(root)
 }
 
@@ -552,6 +676,22 @@ fn remove_thumbnail_for_vault_key(vault_key: &str) -> Result<bool, String> {
             err
         )
     })?;
+    Ok(true)
+}
+
+fn remove_favicon_file(favicon_path: &str) -> Result<bool, String> {
+    let trimmed = favicon_path.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.exists() || !path.is_file() {
+        return Ok(false);
+    }
+
+    fs::remove_file(&path)
+        .map_err(|err| format!("failed to remove favicon {}: {}", path.display(), err))?;
     Ok(true)
 }
 
@@ -858,6 +998,388 @@ fn sha256_for_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+fn is_http_or_https_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+}
+
+fn normalize_bookmark_url_input(raw: &str) -> Result<Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("bookmark url cannot be empty".to_string());
+    }
+
+    let parsed = Url::parse(trimmed).map_err(|err| format!("invalid bookmark url: {}", err))?;
+    if !is_http_or_https_url(&parsed) {
+        return Err("only http:// and https:// URLs are supported".to_string());
+    }
+    Ok(parsed)
+}
+
+fn normalize_optional_trimmed_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|candidate| candidate.trim().to_string())
+        .filter(|candidate| !candidate.is_empty())
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_bookmark_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .timeout(Duration::from_secs(BOOKMARK_FETCH_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(4))
+        .user_agent(BOOKMARK_USER_AGENT)
+        .build()
+        .map_err(|err| format!("failed to build bookmark http client: {}", err))
+}
+
+async fn fetch_bookmark_page_html(
+    client: &reqwest::Client,
+    url: &Url,
+) -> Result<(Url, Option<String>), String> {
+    let mut last_error: Option<String> = None;
+
+    for attempt in 1..=(BOOKMARK_FETCH_RETRIES + 1) {
+        let response_result = client
+            .get(url.clone())
+            .header(ACCEPT, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+            .send()
+            .await;
+
+        let response = match response_result {
+            Ok(response) => response,
+            Err(err) => {
+                let message = format!("bookmark html request failed (attempt {}): {}", attempt, err);
+                eprintln!("{}", message);
+                last_error = Some(message);
+                continue;
+            }
+        };
+
+        let final_url = response.url().clone();
+        if !is_http_or_https_url(&final_url) {
+            return Err(format!(
+                "redirected to unsupported url scheme: {}",
+                final_url.as_str()
+            ));
+        }
+
+        if !response.status().is_success() {
+            eprintln!(
+                "bookmark html request returned status {} for {}",
+                response.status(),
+                final_url
+            );
+            return Ok((final_url, None));
+        }
+
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > BOOKMARK_HTML_MAX_BYTES {
+                eprintln!(
+                    "bookmark html skipped due to content-length {} > {} for {}",
+                    content_length, BOOKMARK_HTML_MAX_BYTES, final_url
+                );
+                return Ok((final_url, None));
+            }
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_ascii_lowercase());
+        let is_html = content_type
+            .as_deref()
+            .map(|value| value.contains("text/html") || value.contains("application/xhtml"))
+            .unwrap_or(true);
+        if !is_html {
+            return Ok((final_url, None));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| format!("failed to read bookmark html response: {}", err))?;
+        if bytes.len() > BOOKMARK_HTML_MAX_BYTES {
+            eprintln!(
+                "bookmark html exceeded max size after download {} > {} for {}",
+                bytes.len(),
+                BOOKMARK_HTML_MAX_BYTES,
+                final_url
+            );
+            return Ok((final_url, None));
+        }
+
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        return Ok((final_url, Some(html)));
+    }
+
+    Err(last_error.unwrap_or_else(|| "bookmark html request failed".to_string()))
+}
+
+fn html_title_and_favicon_candidates(
+    html: &str,
+    final_url: &Url,
+) -> (Option<String>, Vec<Url>) {
+    let document = Html::parse_document(html);
+    let mut title: Option<String> = None;
+    let mut og_title: Option<String> = None;
+    let mut weighted_candidates: Vec<(u8, Url)> = Vec::new();
+
+    if let Ok(title_selector) = Selector::parse("title") {
+        if let Some(node) = document.select(&title_selector).next() {
+            let text = collapse_whitespace(&node.text().collect::<Vec<_>>().join(" "));
+            if !text.is_empty() {
+                title = Some(text);
+            }
+        }
+    }
+
+    if let Ok(meta_selector) = Selector::parse("meta") {
+        for node in document.select(&meta_selector) {
+            let property = node
+                .value()
+                .attr("property")
+                .or_else(|| node.value().attr("name"))
+                .map(|value| value.trim().to_ascii_lowercase());
+            if property.as_deref() != Some("og:title") {
+                continue;
+            }
+            let content = node
+                .value()
+                .attr("content")
+                .map(collapse_whitespace)
+                .filter(|value| !value.is_empty());
+            if content.is_some() {
+                og_title = content;
+                break;
+            }
+        }
+    }
+
+    if let Ok(link_selector) = Selector::parse("link[href]") {
+        for node in document.select(&link_selector) {
+            let rel = node
+                .value()
+                .attr("rel")
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if rel.is_empty() {
+                continue;
+            }
+
+            let priority = if rel.contains("shortcut icon") {
+                Some(0)
+            } else if rel
+                .split_whitespace()
+                .any(|token| token == "icon" || token == "shortcut")
+            {
+                Some(1)
+            } else if rel.contains("apple-touch-icon") {
+                Some(2)
+            } else {
+                None
+            };
+            let Some(priority) = priority else {
+                continue;
+            };
+
+            let href = match node.value().attr("href") {
+                Some(href) if !href.trim().is_empty() => href.trim(),
+                _ => continue,
+            };
+
+            let resolved = match final_url.join(href) {
+                Ok(url) => url,
+                Err(_) => continue,
+            };
+            if !is_http_or_https_url(&resolved) {
+                continue;
+            }
+
+            weighted_candidates.push((priority, resolved));
+        }
+    }
+
+    weighted_candidates.sort_by_key(|(priority, _)| *priority);
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (_, candidate) in weighted_candidates {
+        if seen.insert(candidate.as_str().to_string()) {
+            candidates.push(candidate);
+        }
+    }
+
+    if let Ok(fallback) = final_url.join("/favicon.ico") {
+        if is_http_or_https_url(&fallback) && seen.insert(fallback.as_str().to_string()) {
+            candidates.push(fallback);
+        }
+    }
+
+    (title.or(og_title), candidates)
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).to_ascii_lowercase();
+    head.contains("<svg")
+}
+
+fn infer_favicon_extension(
+    content_type_header: Option<&str>,
+    source_url: &Url,
+    bytes: &[u8],
+) -> String {
+    let content_type = content_type_header
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) || content_type.contains("image/png") {
+        return "png".to_string();
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) || content_type.contains("image/jpeg") {
+        return "jpg".to_string();
+    }
+    if bytes.starts_with(b"GIF8") || content_type.contains("image/gif") {
+        return "gif".to_string();
+    }
+    if bytes.len() >= 12
+        && &bytes[0..4] == b"RIFF"
+        && &bytes[8..12] == b"WEBP"
+        || content_type.contains("image/webp")
+    {
+        return "webp".to_string();
+    }
+    if bytes.len() >= 4
+        && bytes[0] == 0x00
+        && bytes[1] == 0x00
+        && (bytes[2] == 0x01 || bytes[2] == 0x02)
+        && bytes[3] == 0x00
+        || content_type.contains("image/x-icon")
+        || content_type.contains("vnd.microsoft.icon")
+        || content_type.contains("image/ico")
+    {
+        return "ico".to_string();
+    }
+    if looks_like_svg(bytes) || content_type.contains("image/svg") {
+        return "svg".to_string();
+    }
+
+    if let Some(ext) = source_url
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .and_then(|segment| Path::new(segment).extension())
+        .and_then(OsStr::to_str)
+    {
+        let normalized = normalize_ext(ext);
+        if matches!(
+            normalized.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "svg"
+        ) {
+            return if normalized == "jpeg" {
+                "jpg".to_string()
+            } else {
+                normalized
+            };
+        }
+    }
+
+    "ico".to_string()
+}
+
+async fn download_favicon_candidate(
+    client: &reqwest::Client,
+    favicon_url: &Url,
+) -> Result<(Vec<u8>, String), String> {
+    let mut last_error: Option<String> = None;
+
+    for attempt in 1..=(BOOKMARK_FETCH_RETRIES + 1) {
+        let response_result = client
+            .get(favicon_url.clone())
+            .header(ACCEPT, "image/*,*/*;q=0.8")
+            .send()
+            .await;
+
+        let response = match response_result {
+            Ok(response) => response,
+            Err(err) => {
+                let message = format!(
+                    "favicon request failed for {} (attempt {}): {}",
+                    favicon_url, attempt, err
+                );
+                last_error = Some(message.clone());
+                eprintln!("{}", message);
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let message = format!(
+                "favicon request returned status {} for {}",
+                response.status(),
+                favicon_url
+            );
+            last_error = Some(message.clone());
+            eprintln!("{}", message);
+            continue;
+        }
+
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > BOOKMARK_FAVICON_MAX_BYTES {
+                let message = format!(
+                    "favicon too large for {} ({} bytes > {} bytes)",
+                    favicon_url, content_length, BOOKMARK_FAVICON_MAX_BYTES
+                );
+                last_error = Some(message.clone());
+                eprintln!("{}", message);
+                continue;
+            }
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string());
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| format!("failed to read favicon response {}: {}", favicon_url, err))?;
+        if bytes.is_empty() {
+            last_error = Some(format!("favicon response empty: {}", favicon_url));
+            continue;
+        }
+        if bytes.len() > BOOKMARK_FAVICON_MAX_BYTES {
+            let message = format!(
+                "favicon exceeded max size after download for {} ({} bytes > {} bytes)",
+                favicon_url,
+                bytes.len(),
+                BOOKMARK_FAVICON_MAX_BYTES
+            );
+            last_error = Some(message.clone());
+            eprintln!("{}", message);
+            continue;
+        }
+
+        let ext = infer_favicon_extension(content_type.as_deref(), favicon_url, &bytes);
+        return Ok((bytes.to_vec(), ext));
+    }
+
+    Err(last_error.unwrap_or_else(|| format!("failed to download favicon: {}", favicon_url)))
+}
+
+fn store_favicon_bytes(bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
+    let root = ensure_favicons_root_internal()?;
+    let filename = format!("{}.{}", sha256_for_bytes(bytes), normalize_ext(ext));
+    let path = root.join(filename);
+    if !path.exists() {
+        fs::write(&path, bytes)
+            .map_err(|err| format!("failed to write favicon {}: {}", path.display(), err))?;
+    }
+    Ok(path)
 }
 
 struct VaultImportComputation {
@@ -1324,6 +1846,9 @@ fn load_app_state() -> Result<DbAppState, String> {
                 i.height,
                 i.thumb_status,
                 i.import_status,
+                i.url,
+                i.favicon_path,
+                i.meta_status,
                 i.description,
                 i.created_at,
                 i.updated_at,
@@ -1338,7 +1863,7 @@ fn load_app_state() -> Result<DbAppState, String> {
 
     let items_iter = items_stmt
         .query_map([], |row| {
-            let tag_names: String = row.get(15)?;
+            let tag_names: String = row.get(18)?;
             let tags = if tag_names.is_empty() {
                 Vec::new()
             } else {
@@ -1358,9 +1883,12 @@ fn load_app_state() -> Result<DbAppState, String> {
                 height: row.get(9)?,
                 thumb_status: normalize_thumb_status(&row.get::<_, String>(10)?),
                 import_status: normalize_import_status(&row.get::<_, String>(11)?),
-                description: row.get(12)?,
-                created_at: row.get(13)?,
-                updated_at: row.get(14)?,
+                url: row.get(12)?,
+                favicon_path: row.get(13)?,
+                meta_status: normalize_meta_status(&row.get::<_, String>(14)?),
+                description: row.get(15)?,
+                created_at: row.get(16)?,
+                updated_at: row.get(17)?,
                 tags,
             })
         })
@@ -1583,24 +2111,60 @@ fn delete_collection(id: String) -> Result<usize, String> {
         return Err("collection id cannot be empty".to_string());
     }
 
+    let (subtree_ids, item_ids) = {
+        let mut connection = open_db_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM collections WHERE id = ?1",
+                params![&trimmed_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to verify collection before delete: {}", err))?;
+        if exists.is_none() {
+            return Ok(0);
+        }
+
+        let subtree_ids = collect_collection_subtree_ids_in_tx(&transaction, &trimmed_id)?;
+        let mut item_ids = Vec::new();
+        let mut seen_item_ids = BTreeSet::new();
+        for collection_id in &subtree_ids {
+            let mut stmt = transaction
+                .prepare("SELECT id FROM items WHERE collection_id = ?1")
+                .map_err(|err| format!("failed to prepare collection item query: {}", err))?;
+            let row_iter = stmt
+                .query_map(params![collection_id], |row| row.get::<_, String>(0))
+                .map_err(|err| format!("failed to query collection item ids: {}", err))?;
+
+            for row_result in row_iter {
+                let item_id = row_result
+                    .map_err(|err| format!("failed to read collection item id: {}", err))?;
+                if seen_item_ids.insert(item_id.clone()) {
+                    item_ids.push(item_id);
+                }
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|err| format!("failed to commit collection delete preflight transaction: {}", err))?;
+
+        (subtree_ids, item_ids)
+    };
+
+    if !item_ids.is_empty() {
+        let _ = delete_items_with_cleanup_internal(item_ids)?;
+    }
+
     let mut connection = open_db_connection()?;
     let transaction = connection
         .transaction()
         .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
 
-    let exists = transaction
-        .query_row(
-            "SELECT 1 FROM collections WHERE id = ?1",
-            params![&trimmed_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|err| format!("failed to verify collection before delete: {}", err))?;
-    if exists.is_none() {
-        return Ok(0);
-    }
-
-    let subtree_ids = collect_collection_subtree_ids_in_tx(&transaction, &trimmed_id)?;
     let mut deleted_rows = 0usize;
     for collection_id in subtree_ids.iter().rev() {
         let affected = transaction
@@ -1630,6 +2194,9 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
         height,
         thumb_status,
         import_status,
+        url,
+        favicon_path,
+        meta_status,
         description,
         created_at,
         updated_at,
@@ -1651,10 +2218,13 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
                 height,
                 thumb_status,
                 import_status,
+                url,
+                favicon_path,
+                meta_status,
                 description,
                 created_at,
                 updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 &id,
                 collection_id,
@@ -1668,6 +2238,12 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
                 height,
                 normalize_thumb_status(&thumb_status),
                 normalize_import_status(&import_status),
+                url,
+                favicon_path,
+                meta_status
+                    .as_deref()
+                    .map(normalize_meta_status)
+                    .unwrap_or_else(|| DEFAULT_META_STATUS.to_string()),
                 description,
                 created_at,
                 updated_at,
@@ -1757,8 +2333,7 @@ fn insert_items_batch(items: Vec<InsertItemInput>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn delete_items_with_cleanup(item_ids: Vec<String>) -> Result<DeleteItemsResult, String> {
+fn delete_items_with_cleanup_internal(item_ids: Vec<String>) -> Result<DeleteItemsResult, String> {
     if item_ids.is_empty() {
         return Ok(DeleteItemsResult {
             deleted_rows: 0,
@@ -1774,27 +2349,35 @@ fn delete_items_with_cleanup(item_ids: Vec<String>) -> Result<DeleteItemsResult,
 
     let mut vault_counts_by_key: HashMap<String, i64> = HashMap::new();
     let mut vault_path_by_key: HashMap<String, String> = HashMap::new();
+    let mut favicon_paths_to_check: BTreeSet<String> = BTreeSet::new();
     let mut deleted_rows = 0usize;
 
     for item_id in &item_ids {
-        let maybe_item_vault = transaction
+        let maybe_item_assets = transaction
             .query_row(
-                "SELECT vault_key, vault_path FROM items WHERE id = ?1",
+                "SELECT vault_key, vault_path, favicon_path FROM items WHERE id = ?1",
                 params![item_id],
                 |row| {
                     let vault_key: String = row.get(0)?;
                     let vault_path: String = row.get(1)?;
-                    Ok((vault_key, vault_path))
+                    let favicon_path: Option<String> = row.get(2)?;
+                    Ok((vault_key, vault_path, favicon_path))
                 },
             )
             .optional()
             .map_err(|err| format!("failed to read item before delete: {}", err))?;
 
-        if let Some((vault_key, vault_path)) = maybe_item_vault {
+        if let Some((vault_key, vault_path, favicon_path)) = maybe_item_assets {
             if !vault_key.trim().is_empty() {
                 let next_count = vault_counts_by_key.entry(vault_key.clone()).or_insert(0);
                 *next_count += 1;
                 vault_path_by_key.entry(vault_key).or_insert(vault_path);
+            }
+            if let Some(path) = favicon_path {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    favicon_paths_to_check.insert(trimmed.to_string());
+                }
             }
         }
     }
@@ -1837,6 +2420,21 @@ fn delete_items_with_cleanup(item_ids: Vec<String>) -> Result<DeleteItemsResult,
                     vault_key
                 );
             }
+        }
+    }
+
+    let mut favicon_cleanup_candidates: Vec<String> = Vec::new();
+    for favicon_path in favicon_paths_to_check {
+        let remaining_item_refs: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE favicon_path = ?1",
+                params![&favicon_path],
+                |row| row.get(0),
+            )
+            .map_err(|err| format!("failed to verify remaining favicon refs: {}", err))?;
+
+        if remaining_item_refs == 0 {
+            favicon_cleanup_candidates.push(favicon_path);
         }
     }
 
@@ -1885,6 +2483,12 @@ fn delete_items_with_cleanup(item_ids: Vec<String>) -> Result<DeleteItemsResult,
         });
     }
 
+    for favicon_path in favicon_cleanup_candidates {
+        if let Err(err) = remove_favicon_file(&favicon_path) {
+            eprintln!("failed to remove favicon {}: {}", favicon_path, err);
+        }
+    }
+
     if !rows_to_prune.is_empty() {
         let mut prune_connection = open_db_connection()?;
         let prune_tx = prune_connection
@@ -1910,8 +2514,13 @@ fn delete_items_with_cleanup(item_ids: Vec<String>) -> Result<DeleteItemsResult,
 }
 
 #[tauri::command]
+fn delete_items_with_cleanup(item_ids: Vec<String>) -> Result<DeleteItemsResult, String> {
+    delete_items_with_cleanup_internal(item_ids)
+}
+
+#[tauri::command]
 fn delete_items(item_ids: Vec<String>) -> Result<usize, String> {
-    let result = delete_items_with_cleanup(item_ids)?;
+    let result = delete_items_with_cleanup_internal(item_ids)?;
     Ok(result.deleted_rows)
 }
 
@@ -1979,6 +2588,50 @@ fn update_item_description(item_id: String, description: String) -> Result<i64, 
 }
 
 #[tauri::command]
+fn update_item_bookmark_metadata(input: UpdateItemBookmarkMetadataInput) -> Result<i64, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+    let updated_at = Utc::now().timestamp_millis();
+
+    let normalized_url = match normalize_optional_trimmed_string(input.url) {
+        Some(value) => Some(normalize_bookmark_url_input(&value)?.as_str().to_string()),
+        None => None,
+    };
+    let normalized_title = normalize_optional_trimmed_string(input.title);
+    let normalized_filename = normalize_optional_trimmed_string(input.filename);
+    let normalized_favicon_path = normalize_optional_trimmed_string(input.favicon_path);
+    let normalized_meta_status = normalize_meta_status(&input.meta_status);
+
+    let affected_rows = connection
+        .execute(
+            "UPDATE items
+             SET url = COALESCE(?1, url),
+                 title = COALESCE(?2, title),
+                 filename = COALESCE(?3, filename),
+                 favicon_path = COALESCE(?4, favicon_path),
+                 meta_status = ?5,
+                 updated_at = ?6
+             WHERE id = ?7 AND type = 'bookmark'",
+            params![
+                normalized_url,
+                normalized_title,
+                normalized_filename,
+                normalized_favicon_path,
+                normalized_meta_status,
+                updated_at,
+                input.item_id
+            ],
+        )
+        .map_err(|err| format!("failed to update bookmark metadata: {}", err))?;
+
+    if affected_rows == 0 {
+        return Err("bookmark item not found while updating metadata".to_string());
+    }
+
+    Ok(updated_at)
+}
+
+#[tauri::command]
 fn update_item_media_state(input: UpdateItemMediaStateInput) -> Result<i64, String> {
     initialize_db()?;
     let connection = open_db_connection()?;
@@ -2012,6 +2665,67 @@ fn update_item_media_state(input: UpdateItemMediaStateInput) -> Result<i64, Stri
     }
 
     Ok(updated_at)
+}
+
+#[tauri::command]
+async fn fetch_bookmark_metadata(url: String) -> Result<FetchBookmarkMetadataResult, String> {
+    let normalized_url = normalize_bookmark_url_input(&url)?;
+    let client = build_bookmark_http_client()?;
+
+    let (final_url, html_opt) = match fetch_bookmark_page_html(&client, &normalized_url).await {
+        Ok((final_url, html_opt)) => (final_url, html_opt),
+        Err(error) => {
+            eprintln!(
+                "bookmark html fetch failed for {}: {}. Falling back to favicon-only resolution.",
+                normalized_url, error
+            );
+            (normalized_url.clone(), None)
+        }
+    };
+
+    let (title, favicon_candidates) = match html_opt.as_deref() {
+        Some(html) => html_title_and_favicon_candidates(html, &final_url),
+        None => {
+            let mut candidates = Vec::new();
+            if let Ok(fallback) = final_url.join("/favicon.ico") {
+                if is_http_or_https_url(&fallback) {
+                    candidates.push(fallback);
+                }
+            }
+            (None, candidates)
+        }
+    };
+
+    let mut favicon_path: Option<String> = None;
+    let mut favicon_ext: Option<String> = None;
+    let mut favicon_url_candidate: Option<String> = None;
+
+    for candidate in favicon_candidates {
+        match download_favicon_candidate(&client, &candidate).await {
+            Ok((bytes, ext)) => match store_favicon_bytes(&bytes, &ext) {
+                Ok(stored_path) => {
+                    favicon_path = Some(path_to_string(&stored_path)?);
+                    favicon_ext = Some(ext);
+                    favicon_url_candidate = Some(candidate.as_str().to_string());
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("failed to store favicon from {}: {}", candidate, error);
+                }
+            },
+            Err(error) => {
+                eprintln!("favicon candidate failed {}: {}", candidate, error);
+            }
+        }
+    }
+
+    Ok(FetchBookmarkMetadataResult {
+        final_url: final_url.as_str().to_string(),
+        title,
+        favicon_path,
+        favicon_ext,
+        favicon_url_candidate,
+    })
 }
 
 #[tauri::command]
@@ -2306,12 +3020,14 @@ pub fn run() {
             delete_items_with_cleanup,
             update_items_collection,
             update_item_description,
+            update_item_bookmark_metadata,
             update_item_media_state,
             finalize_item_import,
             mark_item_import_error,
             ensure_storage_root,
             ensure_thumbs_root,
             file_exists,
+            fetch_bookmark_metadata,
             compute_sha256,
             process_import_path_job,
             process_import_bytes_job,

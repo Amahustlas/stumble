@@ -7,11 +7,13 @@ import {
   type DbDeleteItemsWithCleanupResult,
   updateDbItemDescription,
   updateDbItemMediaState,
+  updateDbItemBookmarkMetadata,
   finalizeDbItemImport,
   markDbItemImportError,
   type DbUpdateItemsCollectionResult,
   type DbInsertItemInput,
   type DbThumbStatus,
+  type DbMetaStatus,
 } from "../db";
 
 export async function insertItem(item: DbInsertItemInput): Promise<void> {
@@ -53,6 +55,17 @@ export async function updateItemMediaState(params: {
   thumbStatus?: DbThumbStatus;
 }): Promise<number> {
   return updateDbItemMediaState(params);
+}
+
+export async function updateItemBookmarkMetadata(params: {
+  itemId: string;
+  url?: string | null;
+  title?: string | null;
+  filename?: string | null;
+  faviconPath?: string | null;
+  metaStatus: DbMetaStatus;
+}): Promise<number> {
+  return updateDbItemBookmarkMetadata(params);
 }
 
 export async function finalizeItemImport(params: {

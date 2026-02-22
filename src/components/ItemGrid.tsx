@@ -1,4 +1,5 @@
 import { useState } from "react";
+import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
 import type { Item } from "../App";
 
@@ -58,13 +59,19 @@ function ItemGrid({
       >
         {items.map((item) => {
           const isImporting = item.importStatus === "processing";
+          const isBookmarkMetaPending =
+            item.type === "bookmark" && item.importStatus === "ready" && item.metaStatus === "pending";
           const isThumbPending =
             item.type === "image" &&
             item.importStatus === "ready" &&
             item.thumbStatus === "pending" &&
             !item.hasThumb;
           const hasImportError = item.importStatus === "error";
-          const showErrorOverlay = hasImportError || (item.type === "image" && item.thumbStatus === "error");
+          const hasBookmarkMetaError = item.type === "bookmark" && item.metaStatus === "error";
+          const showErrorOverlay =
+            hasImportError ||
+            hasBookmarkMetaError ||
+            (item.type === "image" && item.thumbStatus === "error");
           const imageSrc =
             item.type === "image"
               ? item.hasThumb && item.thumbUrl
@@ -97,16 +104,31 @@ function ItemGrid({
                     />
                   </>
                 ) : item.type === "bookmark" ? (
-                  <span className="bookmark-favicon" />
+                  <span className="bookmark-favicon" aria-hidden="true">
+                    {item.faviconUrl ? (
+                      <img
+                        className="bookmark-favicon-image"
+                        src={item.faviconUrl}
+                        alt=""
+                        loading="lazy"
+                      />
+                    ) : (
+                      <span className="bookmark-favicon-icon">
+                        <LanguageOutlinedIcon fontSize="inherit" />
+                      </span>
+                    )}
+                  </span>
                 ) : item.type === "note" ? (
                   <p className="note-snippet">{item.noteText || item.description}</p>
                 ) : (
                   <span className="thumbnail-label">{item.type}</span>
                 )}
-                {isImporting && (
+                {(isImporting || isBookmarkMetaPending) && (
                   <div className="thumbnail-status-overlay pending" aria-hidden="true">
                     <span className="thumbnail-status-spinner" />
-                    <span className="thumbnail-status-label">Importing...</span>
+                    <span className="thumbnail-status-label">
+                      {isImporting ? "Importing..." : "Fetching..."}
+                    </span>
                   </div>
                 )}
                 {isThumbPending && (
@@ -123,9 +145,15 @@ function ItemGrid({
                 )}
               </div>
               <div className="item-info">
-                <h4 className="item-title">{item.title}</h4>
+                <h4 className="item-title">
+                  {item.type === "bookmark" && item.metaStatus === "pending"
+                    ? item.title || "Loading..."
+                    : item.title}
+                </h4>
                 <p className="item-dimensions">
-                  {item.type === "image"
+                  {item.type === "bookmark"
+                    ? item.hostname || "bookmark"
+                    : item.type === "image"
                     ? item.width && item.height
                       ? `${item.width}x${item.height}`
                       : "unknown"

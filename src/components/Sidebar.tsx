@@ -15,7 +15,7 @@ type SidebarProps = {
   onSelectCollection: (collectionId: string | null) => void;
   onCreateCollection: (parentId: string | null) => Promise<Collection | null>;
   onRenameCollection: (id: string, name: string) => Promise<boolean>;
-  onDeleteCollection: (id: string) => Promise<void>;
+  onDeleteCollection: (id: string, name: string) => void;
 };
 
 const menuItems = [

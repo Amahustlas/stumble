@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import ContextMenu, { type ContextMenuAction } from "./components/ContextMenu";
 import ItemGrid from "./components/ItemGrid";
@@ -28,8 +29,10 @@ import {
   markItemImportError as markItemImportErrorInDb,
   moveItemsToCollection as moveItemsToCollectionInDb,
   updateItemDescription as updateItemDescriptionInDb,
+  updateItemBookmarkMetadata as updateItemBookmarkMetadataInDb,
   updateItemMediaState as updateItemMediaStateInDb,
 } from "./lib/repositories/itemsRepo";
+import { fetchBookmarkMetadata, type BookmarkMetadataFetchResult } from "./lib/bookmarks";
 import {
   buildVaultKey,
   ensureStorageRoot,
@@ -57,6 +60,7 @@ import {
 export type ItemType = "bookmark" | "image" | "video" | "pdf" | "file" | "note";
 export type ThumbStatus = "ready" | "pending" | "skipped" | "error";
 export type ImportStatus = "ready" | "processing" | "error";
+export type BookmarkMetaStatus = "ready" | "pending" | "error";
 export type ItemStatus = "saved" | "archived" | "processing" | "error";
 
 export type Item = {
@@ -80,6 +84,8 @@ export type Item = {
   previewUrl?: string;
   thumbPath?: string;
   thumbUrl?: string;
+  faviconPath?: string;
+  faviconUrl?: string;
   hasThumb: boolean;
   thumbStatus: ThumbStatus;
   width?: number;
@@ -87,6 +93,8 @@ export type Item = {
   sizeBytes?: number;
   noteText?: string;
   sourceUrl?: string;
+  hostname?: string;
+  metaStatus: BookmarkMetaStatus;
 };
 
 const initialItems: Item[] = [];
@@ -99,6 +107,17 @@ const THUMB_JOB_MAX_RETRIES = 1;
 const THUMB_QUEUE_START_DELAY_MS = 700;
 const USER_INTERACTION_IDLE_MS = 600;
 const IMPORT_QUEUE_CONCURRENCY = 1;
+const BOOKMARK_META_QUEUE_CONCURRENCY = 2;
+const BOOKMARK_META_JOB_TIMEOUT_MS = 12_000;
+const BOOKMARK_META_JOB_MAX_RETRIES = 1;
+const LEFT_PANEL_WIDTH_MIN = 220;
+const LEFT_PANEL_WIDTH_MAX = 420;
+const RIGHT_PANEL_WIDTH_MIN = 280;
+const RIGHT_PANEL_WIDTH_MAX = 520;
+const DEFAULT_LEFT_PANEL_WIDTH = 260;
+const DEFAULT_RIGHT_PANEL_WIDTH = 320;
+const LEFT_PANEL_WIDTH_STORAGE_KEY = "stumble:left-panel-width";
+const RIGHT_PANEL_WIDTH_STORAGE_KEY = "stumble:right-panel-width";
 const DEFAULT_COLLECTION_ICON = "folder";
 const DEFAULT_COLLECTION_COLOR = "#8B8B8B";
 const DEFAULT_COLLECTION_NAME = "New Collection";
@@ -180,6 +199,31 @@ function formatSize(sizeBytes: number): string {
   return `${sizeGb.toFixed(2)} GB`;
 }
 
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function readPersistedPanelWidth(args: {
+  key: string;
+  fallback: number;
+  min: number;
+  max: number;
+}): number {
+  if (typeof window === "undefined") {
+    return args.fallback;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(args.key);
+    if (!raw) return args.fallback;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return args.fallback;
+    return clampNumber(parsed, args.min, args.max);
+  } catch {
+    return args.fallback;
+  }
+}
+
 function normalizeDate(dateValue: string): string {
   const parsed = new Date(dateValue);
   if (Number.isNaN(parsed.getTime())) {
@@ -229,9 +273,34 @@ function normalizeImportStatus(value: string | null | undefined): ImportStatus {
   }
 }
 
-function deriveItemStatus(importStatus: ImportStatus): ItemStatus {
+function normalizeBookmarkMetaStatus(
+  value: string | null | undefined,
+  itemType: ItemType,
+): BookmarkMetaStatus {
+  if (itemType !== "bookmark") {
+    return "ready";
+  }
+
+  switch (value) {
+    case "ready":
+    case "pending":
+    case "error":
+      return value;
+    default:
+      return "ready";
+  }
+}
+
+function deriveItemStatus(args: {
+  itemType: ItemType;
+  importStatus: ImportStatus;
+  metaStatus: BookmarkMetaStatus;
+}): ItemStatus {
+  const { itemType, importStatus, metaStatus } = args;
   if (importStatus === "processing") return "processing";
   if (importStatus === "error") return "error";
+  if (itemType === "bookmark" && metaStatus === "pending") return "processing";
+  if (itemType === "bookmark" && metaStatus === "error") return "error";
   return "saved";
 }
 
@@ -255,6 +324,38 @@ function shouldSkipThumbnailGeneration(args: {
 function yieldToMainThread(): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, 0);
+  });
+}
+
+class AsyncTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number, label: string) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = "AsyncTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+function withAsyncTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      reject(new AsyncTimeoutError(timeoutMs, label));
+    }, timeoutMs);
+
+    promise
+      .then((value) => {
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      })
+      .catch((error) => {
+        window.clearTimeout(timeoutId);
+        reject(error);
+      });
   });
 }
 
@@ -293,17 +394,45 @@ async function blobToPngBytes(blob: Blob): Promise<Uint8Array | null> {
   }
 }
 
-async function readClipboardImageAsPngBytes(): Promise<Uint8Array | null> {
-  if (!("clipboard" in navigator) || typeof navigator.clipboard.read !== "function") {
+function normalizeHttpUrlInput(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
     return null;
   }
 
-  const clipboardItems = await navigator.clipboard.read();
-  for (const clipboardItem of clipboardItems) {
-    const imageType = clipboardItem.types.find((type) => type.startsWith("image/"));
-    if (!imageType) continue;
-    const imageBlob = await clipboardItem.getType(imageType);
-    return blobToPngBytes(imageBlob);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+
+  return parsed.toString();
+}
+
+function hostnameFromUrl(urlValue: string): string {
+  try {
+    return new URL(urlValue).hostname || urlValue;
+  } catch {
+    return urlValue;
+  }
+}
+
+async function readClipboardImageAsPngBytesFromPasteEvent(
+  event: ClipboardEvent,
+): Promise<Uint8Array | null> {
+  const items = event.clipboardData?.items;
+  if (!items || items.length === 0) {
+    return null;
+  }
+
+  for (const item of Array.from(items)) {
+    if (!item.type.startsWith("image/")) continue;
+    const imageFile = item.getAsFile();
+    if (!imageFile) continue;
+    return blobToPngBytes(imageFile);
   }
 
   return null;
@@ -338,6 +467,40 @@ function createImportPlaceholderItem(args: {
     previewUrl: type === "image" ? previewUrl : undefined,
     hasThumb: type !== "image",
     thumbStatus: type === "image" ? "pending" : "ready",
+    metaStatus: "ready",
+  };
+}
+
+function createBookmarkPlaceholderItem(args: {
+  itemId?: string;
+  url: string;
+  collectionId: string | null;
+  collectionPath: string;
+}): Item {
+  const { itemId, url, collectionId, collectionPath } = args;
+  const now = new Date().toISOString().slice(0, 10);
+  const hostname = hostnameFromUrl(url);
+  return {
+    id: itemId ?? createItemId(),
+    filename: hostname,
+    type: "bookmark",
+    title: "Loading...",
+    description: "Fetching bookmark metadata...",
+    rating: 0,
+    status: "processing",
+    importStatus: "ready",
+    tags: [],
+    collectionId,
+    collectionPath,
+    createdAt: now,
+    updatedAt: now,
+    size: "-",
+    format: "url",
+    hasThumb: true,
+    thumbStatus: "ready",
+    sourceUrl: url,
+    hostname,
+    metaStatus: "pending",
   };
 }
 
@@ -446,6 +609,9 @@ function toDbInsertItem(args: {
     height: item.height ?? null,
     thumbStatus: item.thumbStatus,
     importStatus: item.importStatus,
+    url: item.sourceUrl ?? null,
+    faviconPath: item.faviconPath ?? null,
+    metaStatus: item.metaStatus,
     description: item.description,
     createdAt: createdAtMs,
     updatedAt: updatedAtMs,
@@ -462,6 +628,12 @@ function mapDbItemToItem(args: {
   const itemType = normalizeItemType(item.type);
   const thumbStatus = normalizeThumbStatus(item.thumbStatus, itemType);
   const importStatus = normalizeImportStatus(item.importStatus);
+  const metaStatus = normalizeBookmarkMetaStatus(item.metaStatus, itemType);
+  const sourceUrl = item.url?.trim() ? item.url : undefined;
+  const hostname = sourceUrl ? hostnameFromUrl(sourceUrl) : undefined;
+  const faviconPath = item.faviconPath?.trim() ? item.faviconPath : undefined;
+  const faviconUrl =
+    itemType === "bookmark" && faviconPath ? previewUrlFromVaultPath(faviconPath) : undefined;
   const previewUrl =
     itemType === "image" && item.vaultPath.trim().length > 0
       ? previewUrlFromVaultPath(item.vaultPath)
@@ -478,10 +650,13 @@ function mapDbItemToItem(args: {
     id: item.id,
     filename: item.filename,
     type: itemType,
-    title: item.title || fileTitleFromFilename(item.filename),
+    title:
+      itemType === "bookmark"
+        ? item.title || hostname || sourceUrl || "Untitled bookmark"
+        : item.title || fileTitleFromFilename(item.filename),
     description: item.description ?? "",
     rating: 0,
-    status: deriveItemStatus(importStatus),
+    status: deriveItemStatus({ itemType, importStatus, metaStatus }),
     importStatus,
     tags: item.tags ?? [],
     collectionId: item.collectionId,
@@ -492,16 +667,21 @@ function mapDbItemToItem(args: {
     createdAt: formatDateFromTimestampMs(item.createdAt),
     updatedAt: formatDateFromTimestampMs(item.updatedAt),
     size: "-",
-    format: item.filename.split(".").pop()?.toLowerCase() ?? "",
+    format: itemType === "bookmark" ? "url" : item.filename.split(".").pop()?.toLowerCase() ?? "",
     vaultKey: item.vaultKey,
     vaultPath: item.vaultPath,
     previewUrl,
     thumbPath,
     thumbUrl,
+    faviconPath,
+    faviconUrl,
     hasThumb: itemType !== "image" ? true : hasThumb,
     thumbStatus,
     width: item.width ?? undefined,
     height: item.height ?? undefined,
+    sourceUrl,
+    hostname,
+    metaStatus,
   };
 }
 
@@ -515,8 +695,30 @@ function App() {
   const [imageModalItemId, setImageModalItemId] = useState<string | null>(null);
   const [deleteConfirmItemIds, setDeleteConfirmItemIds] = useState<string[]>([]);
   const [moveTargetItemIds, setMoveTargetItemIds] = useState<string[]>([]);
+  const [deleteCollectionConfirm, setDeleteCollectionConfirm] = useState<{
+    collectionId: string;
+    collectionName: string;
+    itemsCount: number;
+    subcollectionsCount: number;
+  } | null>(null);
   const [isActionInProgress, setIsActionInProgress] = useState(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState<string | null>(null);
+  const [leftPanelWidth, setLeftPanelWidth] = useState(() =>
+    readPersistedPanelWidth({
+      key: LEFT_PANEL_WIDTH_STORAGE_KEY,
+      fallback: DEFAULT_LEFT_PANEL_WIDTH,
+      min: LEFT_PANEL_WIDTH_MIN,
+      max: LEFT_PANEL_WIDTH_MAX,
+    }),
+  );
+  const [rightPanelWidth, setRightPanelWidth] = useState(() =>
+    readPersistedPanelWidth({
+      key: RIGHT_PANEL_WIDTH_STORAGE_KEY,
+      fallback: DEFAULT_RIGHT_PANEL_WIDTH,
+      min: RIGHT_PANEL_WIDTH_MIN,
+      max: RIGHT_PANEL_WIDTH_MAX,
+    }),
+  );
   const [contextMenu, setContextMenu] = useState<{
     open: boolean;
     x: number;
@@ -535,6 +737,9 @@ function App() {
     new ThumbnailQueue(THUMB_CONCURRENCY, THUMB_QUEUE_START_DELAY_MS),
   );
   const importQueueRef = useRef<DedupeAsyncQueue>(new DedupeAsyncQueue(IMPORT_QUEUE_CONCURRENCY));
+  const bookmarkMetaQueueRef = useRef<DedupeAsyncQueue>(
+    new DedupeAsyncQueue(BOOKMARK_META_QUEUE_CONCURRENCY),
+  );
   const importSourceByItemIdRef = useRef<Map<string, ImportSource>>(new Map());
   const transientPreviewUrlByItemIdRef = useRef<Map<string, string>>(new Map());
   const imageEvaluationQueueRef = useRef<DedupeAsyncQueue>(new DedupeAsyncQueue(1));
@@ -561,6 +766,74 @@ function App() {
     selectedCollectionId !== null
       ? collectionPathById.get(selectedCollectionId) ?? "All Items"
       : "All Items";
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LEFT_PANEL_WIDTH_STORAGE_KEY, String(leftPanelWidth));
+    } catch {
+      // ignore localStorage write errors
+    }
+  }, [leftPanelWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(RIGHT_PANEL_WIDTH_STORAGE_KEY, String(rightPanelWidth));
+    } catch {
+      // ignore localStorage write errors
+    }
+  }, [rightPanelWidth]);
+
+  const startPanelResize = useCallback(
+    (panel: "left" | "right", startClientX: number) => {
+      const startingWidth = panel === "left" ? leftPanelWidth : rightPanelWidth;
+
+      const previousUserSelect = document.body.style.userSelect;
+      const previousCursor = document.body.style.cursor;
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+
+      const handleMouseMove = (event: MouseEvent) => {
+        const deltaX = event.clientX - startClientX;
+        if (panel === "left") {
+          setLeftPanelWidth(
+            clampNumber(startingWidth + deltaX, LEFT_PANEL_WIDTH_MIN, LEFT_PANEL_WIDTH_MAX),
+          );
+          return;
+        }
+
+        setRightPanelWidth(
+          clampNumber(startingWidth - deltaX, RIGHT_PANEL_WIDTH_MIN, RIGHT_PANEL_WIDTH_MAX),
+        );
+      };
+
+      const handleMouseUp = () => {
+        document.removeEventListener("mousemove", handleMouseMove);
+        document.removeEventListener("mouseup", handleMouseUp);
+        document.body.style.userSelect = previousUserSelect;
+        document.body.style.cursor = previousCursor;
+      };
+
+      document.addEventListener("mousemove", handleMouseMove);
+      document.addEventListener("mouseup", handleMouseUp);
+    },
+    [leftPanelWidth, rightPanelWidth],
+  );
+
+  const handleStartLeftPanelResize = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      startPanelResize("left", event.clientX);
+    },
+    [startPanelResize],
+  );
+
+  const handleStartRightPanelResize = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      startPanelResize("right", event.clientX);
+    },
+    [startPanelResize],
+  );
 
   const createCollection = useCallback(
     async (parentId: string | null): Promise<Collection | null> => {
@@ -603,35 +876,123 @@ function App() {
     }
   }, []);
 
-  const deleteCollection = useCallback(
-    async (id: string): Promise<void> => {
-      const targetCollection = collections.find((collection) => collection.id === id);
-      const deletedSubtreeIds = collectCollectionSubtreeIds(collections, id);
-      try {
-        await deleteCollectionInDb(id);
-        const refreshedCollections = await getAllCollectionsInDb();
-        setCollections(refreshedCollections);
-        setSelectedCollectionId((currentSelectedCollectionId) => {
-          if (!currentSelectedCollectionId) return currentSelectedCollectionId;
-          if (!deletedSubtreeIds.has(currentSelectedCollectionId)) {
-            return currentSelectedCollectionId;
-          }
-
-          const fallbackParentId = targetCollection?.parentId ?? null;
-          if (
-            fallbackParentId &&
-            refreshedCollections.some((collection) => collection.id === fallbackParentId)
-          ) {
-            return fallbackParentId;
-          }
-          return null;
-        });
-      } catch (error) {
-        console.error("Failed to delete collection:", error);
-      }
+  const getCollectionDeleteImpact = useCallback(
+    (collectionId: string) => {
+      const subtreeIds = collectCollectionSubtreeIds(collections, collectionId);
+      const itemsCount = items.reduce((count, item) => {
+        if (item.collectionId && subtreeIds.has(item.collectionId)) {
+          return count + 1;
+        }
+        return count;
+      }, 0);
+      return {
+        subtreeIds,
+        itemsCount,
+        subcollectionsCount: Math.max(0, subtreeIds.size - 1),
+      };
     },
-    [collections],
+    [collections, items],
   );
+
+  const requestDeleteCollection = useCallback(
+    (id: string, name: string) => {
+      const collectionExists = collections.some((collection) => collection.id === id);
+      if (!collectionExists) {
+        return;
+      }
+      const impact = getCollectionDeleteImpact(id);
+      setDeleteCollectionConfirm({
+        collectionId: id,
+        collectionName: name,
+        itemsCount: impact.itemsCount,
+        subcollectionsCount: impact.subcollectionsCount,
+      });
+    },
+    [collections, getCollectionDeleteImpact],
+  );
+
+  const performDeleteCollection = useCallback(async () => {
+    const pendingDelete = deleteCollectionConfirm;
+    if (!pendingDelete) return;
+
+    const { collectionId } = pendingDelete;
+    const targetCollection = collections.find((collection) => collection.id === collectionId);
+    if (!targetCollection) {
+      setDeleteCollectionConfirm(null);
+      return;
+    }
+
+    const { subtreeIds } = getCollectionDeleteImpact(collectionId);
+    const removedItems = items.filter(
+      (item) => item.collectionId !== null && subtreeIds.has(item.collectionId),
+    );
+    const removedItemIds = new Set(removedItems.map((item) => item.id));
+
+    setIsActionInProgress(true);
+    try {
+      await deleteCollectionInDb(collectionId);
+      const refreshedCollections = await getAllCollectionsInDb();
+      setCollections(refreshedCollections);
+      setSelectedCollectionId((currentSelectedCollectionId) => {
+        if (!currentSelectedCollectionId) return currentSelectedCollectionId;
+        if (!subtreeIds.has(currentSelectedCollectionId)) {
+          return currentSelectedCollectionId;
+        }
+
+        const fallbackParentId = targetCollection.parentId ?? null;
+        if (
+          fallbackParentId &&
+          refreshedCollections.some((collection) => collection.id === fallbackParentId)
+        ) {
+          return fallbackParentId;
+        }
+        return null;
+      });
+    } catch (error) {
+      console.error("Failed to delete collection:", error);
+      return;
+    } finally {
+      setIsActionInProgress(false);
+    }
+
+    setDeleteCollectionConfirm(null);
+    if (removedItemIds.size === 0) {
+      return;
+    }
+
+    setItems((currentItems) =>
+      currentItems.filter((item) => !removedItemIds.has(item.id)),
+    );
+    setSelectedIds((currentSelectedIds) =>
+      currentSelectedIds.filter((itemId) => !removedItemIds.has(itemId)),
+    );
+    setSelectionAnchorId((currentAnchorId) =>
+      currentAnchorId !== null && removedItemIds.has(currentAnchorId) ? null : currentAnchorId,
+    );
+    setDescriptionPersistRequest((current) =>
+      current && removedItemIds.has(current.itemId) ? null : current,
+    );
+    removedItems.forEach((item) => {
+      const previewUrl = transientPreviewUrlByItemIdRef.current.get(item.id);
+      if (previewUrl) {
+        transientPreviewUrlByItemIdRef.current.delete(item.id);
+        if (previewUrl.startsWith("blob:")) {
+          URL.revokeObjectURL(previewUrl);
+        }
+      }
+      descriptionDraftByItemIdRef.current.delete(item.id);
+    });
+  }, [
+    deleteCollectionConfirm,
+    collections,
+    items,
+    getCollectionDeleteImpact,
+  ]);
+
+  const handleConfirmDeleteCollection = useCallback(() => {
+    if (isActionInProgress) return;
+    void performDeleteCollection();
+  }, [isActionInProgress, performDeleteCollection]);
 
   useEffect(() => {
     itemsRef.current = items;
@@ -696,6 +1057,250 @@ function App() {
       });
     },
     [],
+  );
+
+  const persistBookmarkMetadataState = useCallback(
+    async (params: {
+      itemId: string;
+      metaStatus: BookmarkMetaStatus;
+      url?: string | null;
+      title?: string | null;
+      filename?: string | null;
+      faviconPath?: string | null;
+    }) =>
+      updateItemBookmarkMetadataInDb({
+        itemId: params.itemId,
+        metaStatus: params.metaStatus,
+        url: params.url,
+        title: params.title,
+        filename: params.filename,
+        faviconPath: params.faviconPath,
+      }),
+    [],
+  );
+
+  const applyBookmarkMetadataSuccess = useCallback(
+    async (itemId: string, requestedUrl: string, metadata: BookmarkMetadataFetchResult) => {
+      const finalUrl = normalizeHttpUrlInput(metadata.finalUrl) ?? requestedUrl;
+      const currentItem = itemsRef.current.find((candidate) => candidate.id === itemId) ?? null;
+      const nextHostname = hostnameFromUrl(finalUrl);
+      const currentTitle =
+        currentItem?.title && currentItem.title !== "Loading..." ? currentItem.title : "";
+      const nextTitle =
+        metadata.title?.trim() || currentTitle || nextHostname || finalUrl;
+      const nextFilename = nextHostname || currentItem?.filename || "bookmark";
+      const nextFaviconPath = metadata.faviconPath?.trim() || currentItem?.faviconPath;
+      const updatedAtMs = await persistBookmarkMetadataState({
+        itemId,
+        metaStatus: "ready",
+        url: finalUrl,
+        title: nextTitle,
+        filename: nextFilename,
+        faviconPath: metadata.faviconPath ?? null,
+      });
+      if (isUnmountedRef.current) return;
+
+      setItems((currentItems) =>
+        currentItems.map((item) => {
+          if (item.id !== itemId || item.type !== "bookmark") {
+            return item;
+          }
+          const faviconUrl = nextFaviconPath ? previewUrlFromVaultPath(nextFaviconPath) : undefined;
+          const nextMetaStatus: BookmarkMetaStatus = "ready";
+          const nextDescription =
+            item.description === "Fetching bookmark metadata..." ? "" : item.description;
+          return {
+            ...item,
+            title: nextTitle,
+            filename: nextFilename,
+            sourceUrl: finalUrl,
+            hostname: nextHostname,
+            faviconPath: nextFaviconPath,
+            faviconUrl,
+            metaStatus: nextMetaStatus,
+            description: nextDescription,
+            status: deriveItemStatus({
+              itemType: "bookmark",
+              importStatus: item.importStatus,
+              metaStatus: nextMetaStatus,
+            }),
+            updatedAt: formatDateFromTimestampMs(updatedAtMs),
+          };
+        }),
+      );
+    },
+    [persistBookmarkMetadataState],
+  );
+
+  const applyBookmarkMetadataError = useCallback(
+    async (itemId: string, error: unknown) => {
+      console.error("Bookmark metadata job failed:", itemId, error);
+      let updatedAtMs: number | null = null;
+      try {
+        updatedAtMs = await persistBookmarkMetadataState({
+          itemId,
+          metaStatus: "error",
+        });
+      } catch (dbError) {
+        console.error("Failed to persist bookmark metadata error:", itemId, dbError);
+      }
+      if (isUnmountedRef.current) return;
+
+      setItems((currentItems) =>
+        currentItems.map((item) => {
+          if (item.id !== itemId || item.type !== "bookmark") {
+            return item;
+          }
+          const nextMetaStatus: BookmarkMetaStatus = "error";
+          const fallbackTitle =
+            item.title === "Loading..." ? item.hostname || item.sourceUrl || "Bookmark" : item.title;
+          return {
+            ...item,
+            title: fallbackTitle,
+            description:
+              item.description === "Fetching bookmark metadata..."
+                ? "Bookmark metadata unavailable."
+                : item.description,
+            metaStatus: nextMetaStatus,
+            status: deriveItemStatus({
+              itemType: "bookmark",
+              importStatus: item.importStatus,
+              metaStatus: nextMetaStatus,
+            }),
+            updatedAt:
+              updatedAtMs !== null ? formatDateFromTimestampMs(updatedAtMs) : item.updatedAt,
+          };
+        }),
+      );
+    },
+    [persistBookmarkMetadataState],
+  );
+
+  const enqueueBookmarkMetadataJob = useCallback(
+    (itemId: string, fallbackUrl?: string) => {
+      const queueItem = itemsRef.current.find((candidate) => candidate.id === itemId) ?? null;
+      const sourceUrl =
+        queueItem?.type === "bookmark" && queueItem.sourceUrl ? queueItem.sourceUrl : fallbackUrl;
+      if (!sourceUrl) {
+        return;
+      }
+      const dedupeKey = `${itemId}:${sourceUrl}`;
+      console.log("[bookmark-queue] enqueue", { itemId, url: sourceUrl });
+      bookmarkMetaQueueRef.current.enqueue({
+        dedupeKey,
+        run: async () => {
+          const latest = itemsRef.current.find((candidate) => candidate.id === itemId);
+          const activeUrl =
+            latest?.type === "bookmark" && latest.sourceUrl ? latest.sourceUrl : sourceUrl;
+          const maxAttempts = BOOKMARK_META_JOB_MAX_RETRIES + 1;
+          let lastError: unknown = new Error("Bookmark metadata fetch did not run.");
+
+          for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            try {
+              console.log("[bookmark-queue] start", { itemId, url: activeUrl, attempt });
+              const startedAt = Date.now();
+              const metadata = await withAsyncTimeout(
+                fetchBookmarkMetadata(activeUrl),
+                BOOKMARK_META_JOB_TIMEOUT_MS,
+                "bookmark metadata fetch",
+              );
+              await applyBookmarkMetadataSuccess(itemId, activeUrl, metadata);
+              console.log("[bookmark-queue] finish", {
+                itemId,
+                status: "success",
+                attempt,
+                durationMs: Date.now() - startedAt,
+                finalUrl: metadata.finalUrl,
+                hasTitle: Boolean(metadata.title),
+                hasFavicon: Boolean(metadata.faviconPath),
+                faviconUrlCandidate: metadata.faviconUrlCandidate,
+              });
+              await yieldToMainThread();
+              return;
+            } catch (error) {
+              lastError = error;
+              if (attempt < maxAttempts) {
+                console.warn("[bookmark-queue] retry", { itemId, attempt, url: activeUrl, error });
+                continue;
+              }
+            }
+          }
+
+          console.error("[bookmark-queue] finish", {
+            itemId,
+            status: "error",
+            url: activeUrl,
+            error: lastError,
+          });
+          await applyBookmarkMetadataError(itemId, lastError);
+          await yieldToMainThread();
+        },
+        onError: (error) => {
+          console.error("[bookmark-queue] crashed", { itemId, url: sourceUrl, error });
+        },
+      });
+    },
+    [applyBookmarkMetadataError, applyBookmarkMetadataSuccess],
+  );
+
+  const queueBookmarkUrls = useCallback(
+    async (rawUrls: string[]) => {
+      const normalizedUrls = Array.from(
+        new Set(
+          rawUrls
+            .map((value) => normalizeHttpUrlInput(value))
+            .filter((value): value is string => Boolean(value)),
+        ),
+      );
+      if (normalizedUrls.length === 0) return;
+
+      const placeholders = normalizedUrls.map((url) =>
+        createBookmarkPlaceholderItem({
+          url,
+          collectionId: selectedCollectionId,
+          collectionPath: selectedCollectionPath,
+        }),
+      );
+      const baseTimestamp = Date.now();
+
+      try {
+        await insertItemsInDb(
+          placeholders.map((item, index) =>
+            toDbInsertItem({
+              item,
+              createdAtMs: baseTimestamp + index,
+              updatedAtMs: baseTimestamp + index,
+            }),
+          ),
+        );
+      } catch (error) {
+        console.error("Failed to insert bookmark placeholders:", error);
+        return;
+      }
+
+      if (isUnmountedRef.current) {
+        return;
+      }
+
+      setItems((currentItems) => [...placeholders, ...currentItems]);
+      const placeholderIds = placeholders.map((item) => item.id);
+      setSelectedIds(placeholderIds);
+      setSelectionAnchorId(placeholderIds[placeholderIds.length - 1] ?? null);
+      await yieldToMainThread();
+
+      if (isUnmountedRef.current) {
+        return;
+      }
+
+      placeholders.forEach((placeholder) => {
+        enqueueBookmarkMetadataJob(placeholder.id, placeholder.sourceUrl);
+      });
+    },
+    [
+      selectedCollectionId,
+      selectedCollectionPath,
+      enqueueBookmarkMetadataJob,
+    ],
   );
 
   const persistThumbStatusForVaultKey = useCallback(
@@ -1583,6 +2188,7 @@ function App() {
     isUnmountedRef.current = false;
     thumbnailQueueRef.current = new ThumbnailQueue(THUMB_CONCURRENCY, THUMB_QUEUE_START_DELAY_MS);
     importQueueRef.current = new DedupeAsyncQueue(IMPORT_QUEUE_CONCURRENCY);
+    bookmarkMetaQueueRef.current = new DedupeAsyncQueue(BOOKMARK_META_QUEUE_CONCURRENCY);
     importSourceByItemIdRef.current.clear();
     transientPreviewUrlByItemIdRef.current.clear();
     imageEvaluationQueueRef.current = new DedupeAsyncQueue(1);
@@ -1597,6 +2203,7 @@ function App() {
       transientPreviewUrlByItemIdRef.current.clear();
       thumbnailQueueRef.current.dispose();
       importQueueRef.current.dispose();
+      bookmarkMetaQueueRef.current.dispose();
       importSourceByItemIdRef.current.clear();
       imageEvaluationQueueRef.current.dispose();
       imageThumbnailEvaluationRequestedRef.current.clear();
@@ -1665,6 +2272,11 @@ function App() {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
 
+      if (deleteCollectionConfirm) {
+        setDeleteCollectionConfirm(null);
+        return;
+      }
+
       if (deleteConfirmItemIds.length > 0) {
         setDeleteConfirmItemIds([]);
         return;
@@ -1690,11 +2302,28 @@ function App() {
     return () => window.removeEventListener("keydown", handleEscape);
   }, [
     imageModalOpen,
+    deleteCollectionConfirm,
     deleteConfirmItemIds.length,
     moveTargetItemIds.length,
     contextMenu.open,
     closeContextMenu,
   ]);
+
+  useEffect(() => {
+    if (!deleteCollectionConfirm) return;
+
+    const handleEnterToConfirmCollectionDelete = (event: KeyboardEvent) => {
+      if (event.key !== "Enter") return;
+      if (isEditableTarget(event.target)) return;
+      if (isActionInProgress) return;
+      event.preventDefault();
+      void performDeleteCollection();
+    };
+
+    window.addEventListener("keydown", handleEnterToConfirmCollectionDelete);
+    return () =>
+      window.removeEventListener("keydown", handleEnterToConfirmCollectionDelete);
+  }, [deleteCollectionConfirm, isActionInProgress, performDeleteCollection]);
 
   useEffect(() => {
     if (!contextMenu.open) return;
@@ -1784,38 +2413,49 @@ function App() {
   ]);
 
   useEffect(() => {
-    const handleClipboardPasteShortcut = (event: KeyboardEvent) => {
-      if (!(event.ctrlKey || event.metaKey)) return;
-      if (event.key.toLowerCase() !== "v") return;
+    const handlePaste = (event: ClipboardEvent) => {
       if (isEditableTarget(event.target)) return;
+
+      const clipboardItems = Array.from(event.clipboardData?.items ?? []);
+      const hasImageItem = clipboardItems.some((item) => item.type.startsWith("image/"));
+      const clipboardText = event.clipboardData?.getData("text/plain") ?? "";
+      const normalizedUrl = hasImageItem ? null : normalizeHttpUrlInput(clipboardText);
+      if (!hasImageItem && !normalizedUrl) {
+        return;
+      }
+      event.preventDefault();
 
       void (async () => {
         try {
-          const pngBytes = await readClipboardImageAsPngBytes();
-          if (!pngBytes) {
-            console.log("Clipboard image not available yet");
+          if (hasImageItem) {
+            const pngBytes = await readClipboardImageAsPngBytesFromPasteEvent(event);
+            if (!pngBytes) {
+              return;
+            }
+            await queueImportSources([
+              {
+                kind: "bytes",
+                bytes: pngBytes,
+                filename: `clipboard-${Date.now()}.png`,
+                type: "image",
+                ext: "png",
+              },
+            ]);
             return;
           }
 
-          await queueImportSources([
-            {
-              kind: "bytes",
-              bytes: pngBytes,
-              filename: `clipboard-${Date.now()}.png`,
-              type: "image",
-              ext: "png",
-            },
-          ]);
+          if (normalizedUrl) {
+            await queueBookmarkUrls([normalizedUrl]);
+          }
         } catch (error) {
-          console.log("Clipboard image not available yet");
-          console.warn("Clipboard image import failed:", error);
+          console.warn("Clipboard paste import failed:", error);
         }
       })();
     };
 
-    window.addEventListener("keydown", handleClipboardPasteShortcut);
-    return () => window.removeEventListener("keydown", handleClipboardPasteShortcut);
-  }, [queueImportSources]);
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
+  }, [queueImportSources, queueBookmarkUrls]);
 
   const scopedItems = useMemo(() => {
     if (!selectedCollectionId) return items;
@@ -1844,6 +2484,7 @@ function App() {
         item.title,
         item.description,
         item.sourceUrl,
+        item.hostname,
         item.noteText,
         item.tags.join(" "),
       ]
@@ -1968,6 +2609,32 @@ function App() {
     }
     filePickerInputRef.current?.click();
   };
+
+  const handleAddUrl = useCallback(() => {
+    const enteredValue = window.prompt("Paste a URL (http/https)", "https://");
+    if (enteredValue === null) return;
+
+    const normalizedUrl = normalizeHttpUrlInput(enteredValue);
+    if (!normalizedUrl) {
+      window.alert("Please enter a valid http:// or https:// URL.");
+      return;
+    }
+
+    void queueBookmarkUrls([normalizedUrl]);
+  }, [queueBookmarkUrls]);
+
+  const handleOpenBookmarkUrl = useCallback(async (urlValue: string) => {
+    const normalizedUrl = normalizeHttpUrlInput(urlValue);
+    if (!normalizedUrl) {
+      return;
+    }
+
+    try {
+      await openUrl(normalizedUrl);
+    } catch (error) {
+      console.error("Failed to open bookmark URL:", normalizedUrl, error);
+    }
+  }, []);
 
   const handleItemDoubleClick = (item: Item) => {
     if (item.type !== "image" || !item.previewUrl) return;
@@ -2102,7 +2769,16 @@ function App() {
     ));
 
   return (
-    <main className="app-layout" data-theme="dark">
+    <main
+      className="app-layout"
+      data-theme="dark"
+      style={
+        {
+          "--left-panel-width": `${leftPanelWidth}px`,
+          "--right-panel-width": `${rightPanelWidth}px`,
+        } as React.CSSProperties
+      }
+    >
       <Sidebar
         collections={collectionTree}
         tags={tags}
@@ -2110,7 +2786,14 @@ function App() {
         onSelectCollection={setSelectedCollectionId}
         onCreateCollection={createCollection}
         onRenameCollection={renameCollection}
-        onDeleteCollection={deleteCollection}
+        onDeleteCollection={requestDeleteCollection}
+      />
+      <div
+        className="panel-resize-handle panel-resize-handle-left"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        onMouseDown={handleStartLeftPanelResize}
       />
 
       <section className="content-layout">
@@ -2119,7 +2802,7 @@ function App() {
           onSearchChange={setSearchQuery}
           tileSize={tileSize}
           onTileSizeChange={setTileSize}
-          onAddUrl={() => window.alert("Add URL flow placeholder")}
+          onAddUrl={handleAddUrl}
           onImport={() => {
             void handleImportFromPicker();
           }}
@@ -2149,10 +2832,19 @@ function App() {
         />
       </section>
 
+      <div
+        className="panel-resize-handle panel-resize-handle-right"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize preview panel"
+        onMouseDown={handleStartRightPanelResize}
+      />
+
       <PreviewPanel
         selectedCount={selectedIds.length}
         item={selectedItem}
         onDescriptionChange={handleDescriptionChange}
+        onOpenBookmarkUrl={handleOpenBookmarkUrl}
         onDeleteSelection={() => requestDeleteItems(selectedIds)}
         onMoveSelection={() => requestMoveItems(selectedIds)}
         onDuplicateSelection={() => {
@@ -2172,6 +2864,51 @@ function App() {
         menuRef={contextMenuRef}
         onAction={handleContextMenuAction}
       />
+
+      {deleteCollectionConfirm && (
+        <div
+          className="action-modal-backdrop"
+          onClick={() => {
+            if (isActionInProgress) return;
+            setDeleteCollectionConfirm(null);
+          }}
+          role="presentation"
+        >
+          <div
+            className="action-modal"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete collection confirmation"
+          >
+            <h3 className="action-modal-title">Delete collection?</h3>
+            <p className="action-modal-body">
+              This will permanently delete {deleteCollectionConfirm.itemsCount} items and{" "}
+              {deleteCollectionConfirm.subcollectionsCount} subcollections. This can&apos;t be
+              undone.
+            </p>
+            <div className="action-modal-footer">
+              <button
+                type="button"
+                className="action-modal-button"
+                onClick={() => setDeleteCollectionConfirm(null)}
+                disabled={isActionInProgress}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="action-modal-button danger"
+                onClick={handleConfirmDeleteCollection}
+                disabled={isActionInProgress}
+                autoFocus
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {deleteConfirmItemIds.length > 0 && (
         <div

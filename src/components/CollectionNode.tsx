@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 import AddIcon from "@mui/icons-material/Add";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
@@ -17,6 +17,11 @@ type CollectionNodeProps = {
   onSelect: (id: string) => void;
   onCreateChild: (parentId: string) => void;
   onDelete: (id: string, name: string) => void;
+  activeDropTargetCollectionId: string | null;
+  activeDropMode: "move" | "duplicate" | null;
+  onCollectionDragOver: (collectionId: string, event: DragEvent<HTMLElement>) => void;
+  onCollectionDragLeave: (collectionId: string, event: DragEvent<HTMLElement>) => void;
+  onCollectionDrop: (collectionId: string, event: DragEvent<HTMLElement>) => void;
   onStartRename: (id: string, currentName: string) => void;
   onEditNameChange: (value: string) => void;
   onConfirmRename: () => void;
@@ -42,6 +47,11 @@ function CollectionNode({
   onSelect,
   onCreateChild,
   onDelete,
+  activeDropTargetCollectionId,
+  activeDropMode,
+  onCollectionDragOver,
+  onCollectionDragLeave,
+  onCollectionDrop,
   onStartRename,
   onEditNameChange,
   onConfirmRename,
@@ -51,6 +61,8 @@ function CollectionNode({
   const isExpanded = expandedIds.has(node.collection.id);
   const isSelected = selectedCollectionId === node.collection.id;
   const isEditing = editingCollectionId === node.collection.id;
+  const isDropTarget = activeDropTargetCollectionId === node.collection.id;
+  const [isRowDragOver, setIsRowDragOver] = useState(false);
   const nameInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -59,11 +71,56 @@ function CollectionNode({
     nameInputRef.current?.select();
   }, [isEditing]);
 
+  const handleRowDragEnter = (event: DragEvent<HTMLElement>) => {
+    setIsRowDragOver(true);
+    console.log("[dnd][collection][dragenter]", {
+      targetCollectionId: node.collection.id,
+    });
+    onCollectionDragOver(node.collection.id, event);
+  };
+
+  const handleRowDragOver = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsRowDragOver(true);
+    event.dataTransfer.dropEffect = event.altKey ? "copy" : "move";
+    console.log("[dnd][collection][dragover]", {
+      targetCollectionId: node.collection.id,
+      altKey: event.altKey,
+    });
+    onCollectionDragOver(node.collection.id, event);
+  };
+
+  const handleRowDragLeave = (event: DragEvent<HTMLElement>) => {
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget)) {
+      return;
+    }
+    setIsRowDragOver(false);
+    onCollectionDragLeave(node.collection.id, event);
+  };
+
+  const handleRowDrop = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsRowDragOver(false);
+    console.log("[dnd][collection][drop]", {
+      targetCollectionId: node.collection.id,
+      types: Array.from(event.dataTransfer.types ?? []),
+    });
+    onCollectionDrop(node.collection.id, event);
+  };
+
   return (
     <li className="collection-node">
       <div
-        className={`collection-row ${isSelected ? "active" : ""}`}
+        data-collection-drop-id={node.collection.id}
+        className={`collection-row ${isSelected ? "active" : ""} ${(isDropTarget || isRowDragOver) ? `drop-target drop-${activeDropMode ?? "move"}` : ""}`}
         style={{ paddingLeft: `${8 + depth * 14}px` }}
+        onDragEnterCapture={handleRowDragEnter}
+        onDragOverCapture={handleRowDragOver}
+        onDragLeaveCapture={handleRowDragLeave}
+        onDropCapture={handleRowDrop}
       >
         <button
           type="button"
@@ -166,6 +223,11 @@ function CollectionNode({
               onSelect={onSelect}
               onCreateChild={onCreateChild}
               onDelete={onDelete}
+              activeDropTargetCollectionId={activeDropTargetCollectionId}
+              activeDropMode={activeDropMode}
+              onCollectionDragOver={onCollectionDragOver}
+              onCollectionDragLeave={onCollectionDragLeave}
+              onCollectionDrop={onCollectionDrop}
               onStartRename={onStartRename}
               onEditNameChange={onEditNameChange}
               onConfirmRename={onConfirmRename}

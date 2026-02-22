@@ -3,6 +3,9 @@ import {
   deleteDbItems,
   insertDbItem,
   insertDbItemsBatch,
+  moveDbCollectionItemMemberships,
+  addDbItemsToCollection,
+  reorderDbCollectionItems,
   updateDbItemsCollection,
   type DbDeleteItemsWithCleanupResult,
   updateDbItemDescription,
@@ -11,6 +14,8 @@ import {
   finalizeDbItemImport,
   markDbItemImportError,
   type DbUpdateItemsCollectionResult,
+  type DbUpdateCollectionMembershipsResult,
+  type DbReorderCollectionItemsResult,
   type DbInsertItemInput,
   type DbThumbStatus,
   type DbMetaStatus,
@@ -39,6 +44,28 @@ export async function moveItemsToCollection(
   collectionId: string | null,
 ): Promise<DbUpdateItemsCollectionResult> {
   return updateDbItemsCollection(itemIds, collectionId);
+}
+
+export async function moveCollectionItemMemberships(params: {
+  itemIds: string[];
+  sourceCollectionId: string | null;
+  targetCollectionId: string | null;
+}): Promise<DbUpdateCollectionMembershipsResult> {
+  return moveDbCollectionItemMemberships(params);
+}
+
+export async function addItemsToCollection(
+  itemIds: string[],
+  collectionId: string,
+): Promise<DbUpdateCollectionMembershipsResult> {
+  return addDbItemsToCollection(itemIds, collectionId);
+}
+
+export async function reorderCollectionItems(
+  collectionId: string,
+  orderedItemIds: string[],
+): Promise<DbReorderCollectionItemsResult> {
+  return reorderDbCollectionItems(collectionId, orderedItemIds);
 }
 
 export async function updateItemDescription(

@@ -74,7 +74,12 @@ function ContextMenu({
           } as const,
         ]
       : []),
-    { label: "Duplicate", action: "duplicate", icon: <FileCopyOutlinedIcon fontSize="inherit" /> },
+    {
+      label: "Duplicate",
+      action: "duplicate",
+      shortcut: "Ctrl+D",
+      icon: <FileCopyOutlinedIcon fontSize="inherit" />,
+    },
     { label: "Move to...", action: "move", icon: <DriveFileMoveOutlinedIcon fontSize="inherit" /> },
     { label: "Delete", action: "delete", danger: true, icon: <DeleteOutlineOutlinedIcon fontSize="inherit" /> },
   ];

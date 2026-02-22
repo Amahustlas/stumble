@@ -48,8 +48,19 @@ export type DbItemRecord = {
   tags: string[];
 };
 
+export type DbCollectionItemRecord = {
+  id: string;
+  collectionId: string;
+  itemId: string;
+  customTitle: string | null;
+  customDescription: string | null;
+  sortIndex: number;
+  createdAt: number;
+};
+
 export type DbAppState = {
   collections: DbCollectionRecord[];
+  collectionItems: DbCollectionItemRecord[];
   items: DbItemRecord[];
 };
 
@@ -90,6 +101,20 @@ export type DbDeleteItemsWithCleanupResult = {
 
 export type DbUpdateItemsCollectionResult = {
   updatedRows: number;
+  updatedAt: number;
+};
+
+export type DbUpdateCollectionMembershipsResult = {
+  createdRows: number;
+  updatedRows: number;
+  deletedRows: number;
+  skippedRows: number;
+  updatedAt: number;
+};
+
+export type DbReorderCollectionItemsResult = {
+  updatedRows: number;
+  skippedRows: number;
   updatedAt: number;
 };
 
@@ -169,6 +194,38 @@ export async function updateDbItemsCollection(
   return invoke<DbUpdateItemsCollectionResult>("update_items_collection", {
     itemIds,
     collectionId,
+  });
+}
+
+export async function moveDbCollectionItemMemberships(params: {
+  itemIds: string[];
+  sourceCollectionId: string | null;
+  targetCollectionId: string | null;
+}): Promise<DbUpdateCollectionMembershipsResult> {
+  return invoke<DbUpdateCollectionMembershipsResult>("move_collection_item_memberships", {
+    itemIds: params.itemIds,
+    sourceCollectionId: params.sourceCollectionId,
+    targetCollectionId: params.targetCollectionId,
+  });
+}
+
+export async function addDbItemsToCollection(
+  itemIds: string[],
+  collectionId: string,
+): Promise<DbUpdateCollectionMembershipsResult> {
+  return invoke<DbUpdateCollectionMembershipsResult>("add_items_to_collection", {
+    itemIds,
+    collectionId,
+  });
+}
+
+export async function reorderDbCollectionItems(
+  collectionId: string,
+  orderedItemIds: string[],
+): Promise<DbReorderCollectionItemsResult> {
+  return invoke<DbReorderCollectionItemsResult>("reorder_collection_items", {
+    collectionId,
+    orderedItemIds,
   });
 }
 

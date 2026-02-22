@@ -11,6 +11,11 @@ type CollectionTreeProps = {
   onCreateCollection: (parentId: string | null) => Promise<Collection | null>;
   onRenameCollection: (id: string, name: string) => Promise<boolean>;
   onDeleteCollection: (id: string, name: string) => void;
+  collectionDropTargetId: string | null;
+  collectionDropMode: "move" | "duplicate" | null;
+  onCollectionDragOver: (collectionId: string, event: React.DragEvent<HTMLElement>) => void;
+  onCollectionDragLeave: (collectionId: string, event: React.DragEvent<HTMLElement>) => void;
+  onCollectionDrop: (collectionId: string, event: React.DragEvent<HTMLElement>) => void;
 };
 
 type CollectionSnapshot = {
@@ -41,15 +46,24 @@ function CollectionTree({
   onCreateCollection,
   onRenameCollection,
   onDeleteCollection,
+  collectionDropTargetId,
+  collectionDropMode,
+  onCollectionDragOver,
+  onCollectionDragLeave,
+  onCollectionDrop,
 }: CollectionTreeProps) {
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [editingCollectionId, setEditingCollectionId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
   const isRenameCommitPendingRef = useRef(false);
+  const didInitializeExpandedRootsRef = useRef(false);
 
   const collectionSnapshotById = useMemo(() => flattenNodes(nodes), [nodes]);
 
   useEffect(() => {
+    const shouldInitializeExpandedRoots =
+      !didInitializeExpandedRootsRef.current && nodes.length > 0;
+
     setExpandedIds((currentExpandedIds) => {
       const nextExpandedIds = new Set<string>();
       currentExpandedIds.forEach((expandedId) => {
@@ -57,7 +71,7 @@ function CollectionTree({
           nextExpandedIds.add(expandedId);
         }
       });
-      if (currentExpandedIds.size === 0) {
+      if (shouldInitializeExpandedRoots) {
         nodes.forEach((node) => {
           if (node.children.length > 0) {
             nextExpandedIds.add(node.collection.id);
@@ -66,6 +80,9 @@ function CollectionTree({
       }
       return nextExpandedIds;
     });
+    if (shouldInitializeExpandedRoots) {
+      didInitializeExpandedRootsRef.current = true;
+    }
 
     if (editingCollectionId && !collectionSnapshotById.has(editingCollectionId)) {
       setEditingCollectionId(null);
@@ -202,6 +219,11 @@ function CollectionTree({
               onSelect={onSelectCollection}
               onCreateChild={(parentId) => handleCreateCollection(parentId)}
               onDelete={handleDeleteCollection}
+              activeDropTargetCollectionId={collectionDropTargetId}
+              activeDropMode={collectionDropMode}
+              onCollectionDragOver={onCollectionDragOver}
+              onCollectionDragLeave={onCollectionDragLeave}
+              onCollectionDrop={onCollectionDrop}
               onStartRename={handleStartRename}
               onEditNameChange={setEditingName}
               onConfirmRename={handleConfirmRename}

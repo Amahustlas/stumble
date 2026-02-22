@@ -12,10 +12,16 @@ type SidebarProps = {
   collections: CollectionTreeNode[];
   tags: string[];
   selectedCollectionId: string | null;
+  isItemDragActive?: boolean;
   onSelectCollection: (collectionId: string | null) => void;
   onCreateCollection: (parentId: string | null) => Promise<Collection | null>;
   onRenameCollection: (id: string, name: string) => Promise<boolean>;
   onDeleteCollection: (id: string, name: string) => void;
+  collectionDropTargetId: string | null;
+  collectionDropMode: "move" | "duplicate" | null;
+  onCollectionDragOver: (collectionId: string, event: React.DragEvent<HTMLElement>) => void;
+  onCollectionDragLeave: (collectionId: string, event: React.DragEvent<HTMLElement>) => void;
+  onCollectionDrop: (collectionId: string, event: React.DragEvent<HTMLElement>) => void;
 };
 
 const menuItems = [
@@ -30,10 +36,16 @@ function Sidebar({
   collections,
   tags,
   selectedCollectionId,
+  isItemDragActive = false,
   onSelectCollection,
   onCreateCollection,
   onRenameCollection,
   onDeleteCollection,
+  collectionDropTargetId,
+  collectionDropMode,
+  onCollectionDragOver,
+  onCollectionDragLeave,
+  onCollectionDrop,
 }: SidebarProps) {
   const [activeMenu, setActiveMenu] = useState("All Items");
   const [showTags, setShowTags] = useState(true);
@@ -55,8 +67,51 @@ function Sidebar({
     }
   };
 
+  const resolveCollectionDropTargetId = (target: EventTarget | null): string | null => {
+    if (!(target instanceof Element)) {
+      return null;
+    }
+    const row = target.closest<HTMLElement>("[data-collection-drop-id]");
+    return row?.dataset.collectionDropId ?? null;
+  };
+
   return (
-    <aside className="sidebar">
+    <aside
+      className={`sidebar ${isItemDragActive ? "drag-active" : ""}`}
+      onDragEnter={(event) => {
+        const collectionId = resolveCollectionDropTargetId(event.target);
+        if (!collectionId) {
+          return;
+        }
+        console.log("[dnd][sidebar][fallback][dragenter]", { targetCollectionId: collectionId });
+      }}
+      onDragOver={(event) => {
+        const collectionId = resolveCollectionDropTargetId(event.target);
+        if (!collectionId) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        console.log("[dnd][sidebar][fallback][dragover]", {
+          targetCollectionId: collectionId,
+          altKey: event.altKey,
+        });
+        onCollectionDragOver(collectionId, event);
+      }}
+      onDrop={(event) => {
+        const collectionId = resolveCollectionDropTargetId(event.target);
+        if (!collectionId) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        console.log("[dnd][sidebar][fallback][drop]", {
+          targetCollectionId: collectionId,
+          types: Array.from(event.dataTransfer.types ?? []),
+        });
+        onCollectionDrop(collectionId, event);
+      }}
+    >
       <h1 className="sidebar-title">Stumble</h1>
 
       <div className="sidebar-section">
@@ -89,6 +144,11 @@ function Sidebar({
         onCreateCollection={onCreateCollection}
         onRenameCollection={onRenameCollection}
         onDeleteCollection={onDeleteCollection}
+        collectionDropTargetId={collectionDropTargetId}
+        collectionDropMode={collectionDropMode}
+        onCollectionDragOver={onCollectionDragOver}
+        onCollectionDragLeave={onCollectionDragLeave}
+        onCollectionDrop={onCollectionDrop}
       />
 
       <div className="sidebar-section">

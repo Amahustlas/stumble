@@ -75,10 +75,23 @@ textarea {
 
 .sidebar {
   grid-column: 1;
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
   padding: 12px 10px;
   border-right: 1px solid var(--color-border);
   background: var(--color-panel);
   overflow-y: auto;
+}
+
+.sidebar.drag-active .sidebar-list,
+.sidebar.drag-active .tag-list {
+  pointer-events: none;
+}
+
+.sidebar.drag-active .sidebar-heading-action,
+.sidebar.drag-active .heading-toggle {
+  pointer-events: none;
 }
 
 .panel-resize-handle {
@@ -227,6 +240,7 @@ textarea {
   border-radius: 7px;
   border: 1px solid transparent;
   min-height: 22px;
+  pointer-events: auto;
 }
 
 .collection-row:hover {
@@ -236,6 +250,21 @@ textarea {
 .collection-row.active {
   background: color-mix(in srgb, var(--color-selected) 50%, transparent);
   border-color: color-mix(in srgb, var(--color-border) 70%, transparent);
+}
+
+.collection-row.drop-target {
+  border-color: color-mix(in srgb, var(--color-border) 75%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-border) 35%, transparent);
+}
+
+.collection-row.drop-target.drop-move {
+  background: color-mix(in srgb, var(--color-selected) 58%, transparent);
+}
+
+.collection-row.drop-target.drop-duplicate {
+  background: color-mix(in srgb, #2e9b76 30%, transparent);
+  border-color: color-mix(in srgb, #2e9b76 55%, var(--color-border));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #2e9b76 35%, transparent);
 }
 
 .tree-toggle {
@@ -275,6 +304,7 @@ textarea {
   cursor: pointer;
   font-size: 12px;
   min-width: 0;
+  pointer-events: auto;
 }
 
 .collection-node-icon {
@@ -477,6 +507,8 @@ textarea {
   cursor: pointer;
   display: flex;
   flex-direction: column;
+  user-select: none;
+  -webkit-user-drag: none;
 }
 
 .item-card:hover {
@@ -486,6 +518,22 @@ textarea {
 .item-card.selected {
   border-color: color-mix(in srgb, var(--color-accent) 60%, var(--color-border));
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 28%, transparent);
+}
+
+.item-card.reorder-target {
+  border-color: color-mix(in srgb, var(--color-accent) 60%, var(--color-border));
+}
+
+.item-card.reorder-target-before {
+  box-shadow:
+    inset 0 3px 0 0 color-mix(in srgb, var(--color-accent) 85%, #fff),
+    0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
+
+.item-card.reorder-target-after {
+  box-shadow:
+    inset 0 -3px 0 0 color-mix(in srgb, var(--color-accent) 85%, #fff),
+    0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
 }
 
 .thumbnail {
@@ -510,6 +558,44 @@ textarea {
   height: 100%;
   object-fit: cover;
   display: block;
+  -webkit-user-drag: none;
+}
+
+.custom-item-drag-ghost {
+  position: fixed;
+  z-index: 2000;
+  pointer-events: none;
+  min-width: 148px;
+  max-width: 220px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 75%, transparent);
+  background: color-mix(in srgb, var(--color-panel-elevated) 92%, #000);
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.34);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.custom-item-drag-ghost.move {
+  border-color: color-mix(in srgb, var(--color-accent) 38%, var(--color-border));
+}
+
+.custom-item-drag-ghost.duplicate {
+  border-color: color-mix(in srgb, #2e9b76 58%, var(--color-border));
+}
+
+.custom-item-drag-ghost-label {
+  color: var(--color-muted);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.custom-item-drag-ghost-count {
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.2;
+  font-weight: 600;
 }
 
 .thumbnail-status-overlay {
@@ -1126,6 +1212,52 @@ textarea {
   color: var(--color-muted);
   width: 10px;
   text-align: center;
+}
+
+.snackbar-layer {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 1300;
+  width: min(560px, calc(100vw - 20px));
+  pointer-events: none;
+}
+
+.snackbar {
+  pointer-events: auto;
+  min-height: 44px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
+  background: color-mix(in srgb, #080a0d 92%, var(--color-panel));
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.34);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px 8px 12px;
+}
+
+.snackbar-message {
+  font-size: 12px;
+  color: var(--color-text);
+  line-height: 1.3;
+}
+
+.snackbar-action {
+  border: 1px solid color-mix(in srgb, var(--color-border) 75%, transparent);
+  background: color-mix(in srgb, var(--color-panel-elevated) 80%, transparent);
+  color: var(--color-text);
+  border-radius: 7px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.snackbar-action:hover {
+  background: color-mix(in srgb, var(--color-hover) 70%, transparent);
 }
 
 @media (max-width: 1200px) {

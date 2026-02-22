@@ -12,6 +12,7 @@ import {
   initDb,
   loadDbAppState,
   type Collection,
+  type DbCollectionItemRecord,
   type DbInsertItemInput,
   type DbItemRecord,
 } from "./lib/db";
@@ -27,7 +28,9 @@ import {
   insertItem as insertItemInDb,
   insertItems as insertItemsInDb,
   markItemImportError as markItemImportErrorInDb,
-  moveItemsToCollection as moveItemsToCollectionInDb,
+  moveCollectionItemMemberships as moveCollectionItemMembershipsInDb,
+  addItemsToCollection as addItemsToCollectionInDb,
+  reorderCollectionItems as reorderCollectionItemsInDb,
   updateItemDescription as updateItemDescriptionInDb,
   updateItemBookmarkMetadata as updateItemBookmarkMetadataInDb,
   updateItemMediaState as updateItemMediaStateInDb,
@@ -63,6 +66,15 @@ export type ImportStatus = "ready" | "processing" | "error";
 export type BookmarkMetaStatus = "ready" | "pending" | "error";
 export type ItemStatus = "saved" | "archived" | "processing" | "error";
 
+export type ItemCollectionMembershipInstance = {
+  instanceId: string;
+  collectionId: string;
+  customTitle?: string;
+  customDescription?: string;
+  sortIndex?: number;
+  createdAt: number;
+};
+
 export type Item = {
   id: string;
   filename: string;
@@ -75,6 +87,8 @@ export type Item = {
   tags: string[];
   collectionId: string | null;
   collectionPath: string;
+  collectionIds: string[];
+  collectionInstancesByCollectionId: Record<string, ItemCollectionMembershipInstance>;
   createdAt: string;
   updatedAt: string;
   size: string;
@@ -99,6 +113,395 @@ export type Item = {
 
 const initialItems: Item[] = [];
 
+type UndoableSnackbarActionKind = "move" | "duplicate" | "remove" | "delete";
+
+type SnackbarState = {
+  id: number;
+  message: string;
+  actionKind: UndoableSnackbarActionKind;
+  visibleUntil: number;
+  canUndo: boolean;
+};
+
+type PendingUndoableAction = {
+  id: number;
+  commit: () => Promise<void>;
+  undoUi: () => void;
+  finalizeUi?: () => void;
+  timeoutId: number;
+};
+
+type SidebarItemDragPayload = {
+  kind: "stumble-item-selection";
+  itemIds: string[];
+  sourceCollectionId: string | null;
+  initiatedAt: number;
+};
+
+type PointerItemDragCandidate = {
+  pointerId: number;
+  itemIds: string[];
+  sourceCollectionId: string | null;
+  startX: number;
+  startY: number;
+};
+
+type CustomItemDragState = {
+  pointerId: number;
+  itemIds: string[];
+  sourceCollectionId: string | null;
+  clientX: number;
+  clientY: number;
+  targetCollectionId: string | null;
+  mode: "move" | "duplicate";
+};
+
+const SIDEBAR_ITEM_DRAG_MIME = "application/x-stumble-items";
+
+function createCollectionMembershipInstanceId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `ci-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function cloneItemCollectionInstances(
+  value: Record<string, ItemCollectionMembershipInstance>,
+): Record<string, ItemCollectionMembershipInstance> {
+  const next: Record<string, ItemCollectionMembershipInstance> = {};
+  Object.entries(value).forEach(([collectionId, instance]) => {
+    next[collectionId] = { ...instance };
+  });
+  return next;
+}
+
+function orderedCollectionIdsForItem(args: {
+  currentIds: string[];
+  nextInstancesByCollectionId: Record<string, ItemCollectionMembershipInstance>;
+}): string[] {
+  const { currentIds, nextInstancesByCollectionId } = args;
+  const nextIdsSet = new Set(Object.keys(nextInstancesByCollectionId));
+  const ordered = currentIds.filter((id) => nextIdsSet.has(id));
+  Array.from(nextIdsSet)
+    .filter((id) => !ordered.includes(id))
+    .sort((a, b) => a.localeCompare(b))
+    .forEach((id) => ordered.push(id));
+  return ordered;
+}
+
+function withItemMembershipState(args: {
+  item: Item;
+  nextInstancesByCollectionId: Record<string, ItemCollectionMembershipInstance>;
+  collectionPathById: Map<string, string>;
+  preferredPrimaryCollectionId?: string | null;
+  updatedAt?: string;
+}): Item {
+  const { item, nextInstancesByCollectionId, collectionPathById, updatedAt } = args;
+  const collectionIds = orderedCollectionIdsForItem({
+    currentIds: item.collectionIds,
+    nextInstancesByCollectionId,
+  });
+  const preferredPrimaryCollectionId =
+    args.preferredPrimaryCollectionId === undefined
+      ? item.collectionId
+      : args.preferredPrimaryCollectionId;
+  const primaryCollectionId =
+    preferredPrimaryCollectionId && nextInstancesByCollectionId[preferredPrimaryCollectionId]
+      ? preferredPrimaryCollectionId
+      : collectionIds[0] ?? null;
+
+  return {
+    ...item,
+    collectionInstancesByCollectionId: nextInstancesByCollectionId,
+    collectionIds,
+    collectionId: primaryCollectionId,
+    collectionPath:
+      primaryCollectionId !== null
+        ? collectionPathById.get(primaryCollectionId) ?? "All Items"
+        : "All Items",
+    ...(updatedAt ? { updatedAt } : {}),
+  };
+}
+
+function addCollectionMembershipToItem(args: {
+  item: Item;
+  collectionId: string;
+  collectionPathById: Map<string, string>;
+  instance?: Partial<ItemCollectionMembershipInstance>;
+  preservePrimary?: boolean;
+  updatedAt?: string;
+}): Item {
+  const { item, collectionId, collectionPathById, preservePrimary = true, updatedAt } = args;
+  if (item.collectionInstancesByCollectionId[collectionId]) {
+    return item;
+  }
+  const nextInstancesByCollectionId = cloneItemCollectionInstances(
+    item.collectionInstancesByCollectionId,
+  );
+  nextInstancesByCollectionId[collectionId] = {
+    instanceId: args.instance?.instanceId ?? createCollectionMembershipInstanceId(),
+    collectionId,
+    customTitle: args.instance?.customTitle,
+    customDescription: args.instance?.customDescription,
+    sortIndex: args.instance?.sortIndex ?? args.instance?.createdAt ?? Date.now(),
+    createdAt: args.instance?.createdAt ?? Date.now(),
+  };
+  return withItemMembershipState({
+    item,
+    nextInstancesByCollectionId,
+    collectionPathById,
+    preferredPrimaryCollectionId: preservePrimary ? item.collectionId : collectionId,
+    updatedAt,
+  });
+}
+
+function removeCollectionMembershipFromItem(args: {
+  item: Item;
+  collectionId: string;
+  collectionPathById: Map<string, string>;
+  updatedAt?: string;
+}): Item {
+  const { item, collectionId, collectionPathById, updatedAt } = args;
+  if (!item.collectionInstancesByCollectionId[collectionId]) {
+    return item;
+  }
+  const nextInstancesByCollectionId = cloneItemCollectionInstances(
+    item.collectionInstancesByCollectionId,
+  );
+  delete nextInstancesByCollectionId[collectionId];
+  return withItemMembershipState({
+    item,
+    nextInstancesByCollectionId,
+    collectionPathById,
+    preferredPrimaryCollectionId: item.collectionId === collectionId ? null : item.collectionId,
+    updatedAt,
+  });
+}
+
+function moveCollectionMembershipOnItem(args: {
+  item: Item;
+  sourceCollectionId: string | null;
+  targetCollectionId: string | null;
+  collectionPathById: Map<string, string>;
+  updatedAt?: string;
+}): Item {
+  const { item, sourceCollectionId, targetCollectionId, collectionPathById, updatedAt } = args;
+  if (sourceCollectionId === targetCollectionId) {
+    return item;
+  }
+
+  if (sourceCollectionId === null) {
+    if (targetCollectionId === null) return item;
+    return addCollectionMembershipToItem({
+      item,
+      collectionId: targetCollectionId,
+      collectionPathById,
+      preservePrimary: false,
+      updatedAt,
+    });
+  }
+
+  if (!item.collectionInstancesByCollectionId[sourceCollectionId]) {
+    return item;
+  }
+
+  if (targetCollectionId === null) {
+    return removeCollectionMembershipFromItem({
+      item,
+      collectionId: sourceCollectionId,
+      collectionPathById,
+      updatedAt,
+    });
+  }
+
+  if (item.collectionInstancesByCollectionId[targetCollectionId]) {
+    return removeCollectionMembershipFromItem({
+      item,
+      collectionId: sourceCollectionId,
+      collectionPathById,
+      updatedAt,
+    });
+  }
+
+  const nextInstancesByCollectionId = cloneItemCollectionInstances(
+    item.collectionInstancesByCollectionId,
+  );
+  const sourceInstance = nextInstancesByCollectionId[sourceCollectionId];
+  delete nextInstancesByCollectionId[sourceCollectionId];
+  nextInstancesByCollectionId[targetCollectionId] = {
+    ...sourceInstance,
+    collectionId: targetCollectionId,
+  };
+  return withItemMembershipState({
+    item,
+    nextInstancesByCollectionId,
+    collectionPathById,
+    preferredPrimaryCollectionId: targetCollectionId,
+    updatedAt,
+  });
+}
+
+type ItemMembershipUiSnapshot = Pick<
+  Item,
+  "id" | "collectionId" | "collectionPath" | "collectionIds" | "collectionInstancesByCollectionId" | "updatedAt"
+>;
+
+function createItemMembershipSnapshot(item: Item): ItemMembershipUiSnapshot {
+  return {
+    id: item.id,
+    collectionId: item.collectionId,
+    collectionPath: item.collectionPath,
+    collectionIds: [...item.collectionIds],
+    collectionInstancesByCollectionId: cloneItemCollectionInstances(
+      item.collectionInstancesByCollectionId,
+    ),
+    updatedAt: item.updatedAt,
+  };
+}
+
+function restoreItemMembershipSnapshot(item: Item, snapshot: ItemMembershipUiSnapshot): Item {
+  return {
+    ...item,
+    collectionId: snapshot.collectionId,
+    collectionPath: snapshot.collectionPath,
+    collectionIds: [...snapshot.collectionIds],
+    collectionInstancesByCollectionId: cloneItemCollectionInstances(
+      snapshot.collectionInstancesByCollectionId,
+    ),
+    updatedAt: snapshot.updatedAt,
+  };
+}
+
+function parseSidebarItemDragPayload(dataTransfer: DataTransfer): SidebarItemDragPayload | null {
+  const raw =
+    dataTransfer.getData(SIDEBAR_ITEM_DRAG_MIME) ||
+    dataTransfer.getData("application/x-stumble-item-selection") ||
+    dataTransfer.getData("text/plain");
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<SidebarItemDragPayload>;
+    if (parsed.kind !== "stumble-item-selection") return null;
+    if (!Array.isArray(parsed.itemIds)) return null;
+    const itemIds = parsed.itemIds.filter((value): value is string => typeof value === "string");
+    if (itemIds.length === 0) return null;
+    const sourceCollectionId =
+      typeof parsed.sourceCollectionId === "string" ? parsed.sourceCollectionId : null;
+    return {
+      kind: "stumble-item-selection",
+      itemIds,
+      sourceCollectionId,
+      initiatedAt:
+        typeof parsed.initiatedAt === "number" && Number.isFinite(parsed.initiatedAt)
+          ? parsed.initiatedAt
+          : Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function collectionDropTargetIdFromPoint(clientX: number, clientY: number): string | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  // Primary: geometry-based hit test (more reliable in WebView drag scenarios than event.target/elementsFromPoint).
+  const rows = Array.from(
+    document.querySelectorAll<HTMLElement>("[data-collection-drop-id]"),
+  );
+  for (const row of rows) {
+    const rect = row.getBoundingClientRect();
+    const withinX = clientX >= rect.left && clientX <= rect.right;
+    const withinY = clientY >= rect.top && clientY <= rect.bottom;
+    if (withinX && withinY) {
+      const collectionId = row.dataset.collectionDropId;
+      if (collectionId && collectionId.trim().length > 0) {
+        return collectionId;
+      }
+    }
+  }
+
+  // Secondary: DOM stack lookup when available.
+  if (typeof document.elementsFromPoint === "function") {
+    const stack = document.elementsFromPoint(clientX, clientY);
+    for (const element of stack) {
+      if (!(element instanceof HTMLElement)) continue;
+      const row = element.closest<HTMLElement>("[data-collection-drop-id]");
+      const collectionId = row?.dataset.collectionDropId;
+      if (collectionId && collectionId.trim().length > 0) {
+        return collectionId;
+      }
+    }
+  }
+  return null;
+}
+
+type GridReorderDropTarget = {
+  itemId: string;
+  position: "before" | "after";
+};
+
+function itemGridReorderTargetFromPoint(
+  clientX: number,
+  clientY: number,
+  draggedItemId: string,
+): GridReorderDropTarget | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const cards = Array.from(document.querySelectorAll<HTMLElement>(".item-grid .item-card[data-item-id]"));
+  for (const card of cards) {
+    const targetItemId = card.dataset.itemId;
+    if (!targetItemId || targetItemId === draggedItemId) {
+      continue;
+    }
+    const rect = card.getBoundingClientRect();
+    const withinX = clientX >= rect.left && clientX <= rect.right;
+    const withinY = clientY >= rect.top && clientY <= rect.bottom;
+    if (!withinX || !withinY) {
+      continue;
+    }
+
+    const xRatio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0.5;
+    const yRatio = rect.height > 0 ? (clientY - rect.top) / rect.height : 0.5;
+    const rowTolerancePx = 6;
+    const sameRowCount = cards.reduce((count, candidate) => {
+      const candidateRect = candidate.getBoundingClientRect();
+      return Math.abs(candidateRect.top - rect.top) <= rowTolerancePx ? count + 1 : count;
+    }, 0);
+    const isMultiColumnRow = sameRowCount > 1;
+
+    // Bias toward "before" so dragging onto the first item can reliably place at index 0.
+    let position: "before" | "after";
+    if (isMultiColumnRow) {
+      if (yRatio <= 0.22) {
+        position = "before";
+      } else if (yRatio >= 0.78) {
+        position = "after";
+      } else {
+        position = xRatio >= 0.68 ? "after" : "before";
+      }
+    } else {
+      position = yRatio >= 0.68 ? "after" : "before";
+    }
+    return { itemId: targetItemId, position };
+  }
+  return null;
+}
+
+function isPointInsideItemGridArea(clientX: number, clientY: number): boolean {
+  if (typeof document === "undefined") {
+    return false;
+  }
+  const gridWrap = document.querySelector<HTMLElement>(".item-grid-wrap");
+  if (!gridWrap) {
+    return false;
+  }
+  const rect = gridWrap.getBoundingClientRect();
+  return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+}
+
 const IMAGE_EXTENSIONS = /\.(png|jpe?g|webp|gif|bmp|svg)$/i;
 const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|mkv|avi)$/i;
 const THUMB_SKIP_MAX_DIMENSION = 640;
@@ -110,6 +513,7 @@ const IMPORT_QUEUE_CONCURRENCY = 1;
 const BOOKMARK_META_QUEUE_CONCURRENCY = 2;
 const BOOKMARK_META_JOB_TIMEOUT_MS = 12_000;
 const BOOKMARK_META_JOB_MAX_RETRIES = 1;
+const UNDO_SNACKBAR_TIMEOUT_MS = 7_000;
 const LEFT_PANEL_WIDTH_MIN = 220;
 const LEFT_PANEL_WIDTH_MAX = 420;
 const RIGHT_PANEL_WIDTH_MIN = 280;
@@ -448,6 +852,16 @@ function createImportPlaceholderItem(args: {
 }): Item {
   const { itemId, filename, type, collectionId, collectionPath, previewUrl } = args;
   const now = new Date().toISOString().slice(0, 10);
+  const membershipInstance =
+    collectionId !== null
+      ? {
+          [collectionId]: {
+            instanceId: createCollectionMembershipInstanceId(),
+            collectionId,
+            createdAt: Date.now(),
+          },
+        }
+      : {};
   return {
     id: itemId ?? createItemId(),
     filename,
@@ -460,6 +874,8 @@ function createImportPlaceholderItem(args: {
     tags: ["imported"],
     collectionId,
     collectionPath,
+    collectionIds: collectionId ? [collectionId] : [],
+    collectionInstancesByCollectionId: membershipInstance,
     createdAt: now,
     updatedAt: now,
     size: "-",
@@ -480,6 +896,16 @@ function createBookmarkPlaceholderItem(args: {
   const { itemId, url, collectionId, collectionPath } = args;
   const now = new Date().toISOString().slice(0, 10);
   const hostname = hostnameFromUrl(url);
+  const membershipInstance =
+    collectionId !== null
+      ? {
+          [collectionId]: {
+            instanceId: createCollectionMembershipInstanceId(),
+            collectionId,
+            createdAt: Date.now(),
+          },
+        }
+      : {};
   return {
     id: itemId ?? createItemId(),
     filename: hostname,
@@ -492,6 +918,8 @@ function createBookmarkPlaceholderItem(args: {
     tags: [],
     collectionId,
     collectionPath,
+    collectionIds: collectionId ? [collectionId] : [],
+    collectionInstancesByCollectionId: membershipInstance,
     createdAt: now,
     updatedAt: now,
     size: "-",
@@ -619,12 +1047,28 @@ function toDbInsertItem(args: {
   };
 }
 
+function buildCollectionItemsByItemId(
+  rows: DbCollectionItemRecord[],
+): Map<string, DbCollectionItemRecord[]> {
+  const rowsByItemId = new Map<string, DbCollectionItemRecord[]>();
+  rows.forEach((row) => {
+    const current = rowsByItemId.get(row.itemId);
+    if (current) {
+      current.push(row);
+      return;
+    }
+    rowsByItemId.set(row.itemId, [row]);
+  });
+  return rowsByItemId;
+}
+
 function mapDbItemToItem(args: {
   item: DbItemRecord;
+  collectionItemsByItemId: Map<string, DbCollectionItemRecord[]>;
   collectionPathById: Map<string, string>;
   thumbsRoot: string | null;
 }): Item {
-  const { item, collectionPathById, thumbsRoot } = args;
+  const { item, collectionItemsByItemId, collectionPathById, thumbsRoot } = args;
   const itemType = normalizeItemType(item.type);
   const thumbStatus = normalizeThumbStatus(item.thumbStatus, itemType);
   const importStatus = normalizeImportStatus(item.importStatus);
@@ -646,6 +1090,34 @@ function mapDbItemToItem(args: {
       : undefined;
   const hasThumb = itemType === "image" && thumbStatus === "ready";
   const thumbUrl = hasThumb && thumbPath ? previewUrlFromVaultPath(thumbPath) : undefined;
+  const collectionMembershipRows = collectionItemsByItemId.get(item.id) ?? [];
+  const collectionInstancesByCollectionId: Record<string, ItemCollectionMembershipInstance> = {};
+  collectionMembershipRows.forEach((row) => {
+    collectionInstancesByCollectionId[row.collectionId] = {
+      instanceId: row.id,
+      collectionId: row.collectionId,
+      customTitle: row.customTitle ?? undefined,
+      customDescription: row.customDescription ?? undefined,
+      sortIndex: row.sortIndex,
+      createdAt: row.createdAt,
+    };
+  });
+  if (
+    item.collectionId !== null &&
+    !(item.collectionId in collectionInstancesByCollectionId)
+  ) {
+    collectionInstancesByCollectionId[item.collectionId] = {
+      instanceId: `legacy-${item.id}-${item.collectionId}`,
+      collectionId: item.collectionId,
+      sortIndex: item.createdAt,
+      createdAt: item.createdAt,
+    };
+  }
+  const collectionIds = Object.keys(collectionInstancesByCollectionId);
+  const primaryCollectionId =
+    item.collectionId !== null && collectionInstancesByCollectionId[item.collectionId]
+      ? item.collectionId
+      : collectionIds[0] ?? null;
   return {
     id: item.id,
     filename: item.filename,
@@ -659,11 +1131,13 @@ function mapDbItemToItem(args: {
     status: deriveItemStatus({ itemType, importStatus, metaStatus }),
     importStatus,
     tags: item.tags ?? [],
-    collectionId: item.collectionId,
+    collectionId: primaryCollectionId,
     collectionPath:
-      item.collectionId !== null
-        ? collectionPathById.get(item.collectionId) ?? "All Items"
+      primaryCollectionId !== null
+        ? collectionPathById.get(primaryCollectionId) ?? "All Items"
         : "All Items",
+    collectionIds,
+    collectionInstancesByCollectionId,
     createdAt: formatDateFromTimestampMs(item.createdAt),
     updatedAt: formatDateFromTimestampMs(item.updatedAt),
     size: "-",
@@ -703,6 +1177,14 @@ function App() {
   } | null>(null);
   const [isActionInProgress, setIsActionInProgress] = useState(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState<string | null>(null);
+  const [isItemDragActive, setIsItemDragActive] = useState(false);
+  const [customItemDragState, setCustomItemDragState] = useState<CustomItemDragState | null>(null);
+  const [snackbar, setSnackbar] = useState<SnackbarState | null>(null);
+  const [sidebarCollectionDropState, setSidebarCollectionDropState] = useState<{
+    collectionId: string;
+    mode: "move" | "duplicate";
+  } | null>(null);
+  const [gridReorderDropState, setGridReorderDropState] = useState<GridReorderDropTarget | null>(null);
   const [leftPanelWidth, setLeftPanelWidth] = useState(() =>
     readPersistedPanelWidth({
       key: LEFT_PANEL_WIDTH_STORAGE_KEY,
@@ -748,6 +1230,16 @@ function App() {
   const userInteractionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isUnmountedRef = useRef(false);
   const itemsRef = useRef<Item[]>(initialItems);
+  const pendingUndoableActionRef = useRef<PendingUndoableAction | null>(null);
+  const snackbarSequenceRef = useRef(0);
+  const snackbarInfoTimeoutRef = useRef<number | null>(null);
+  const activeItemDragPayloadRef = useRef<SidebarItemDragPayload | null>(null);
+  const activeItemDragAltRef = useRef(false);
+  const keyboardAltPressedRef = useRef(false);
+  const pointerItemDragCandidateRef = useRef<PointerItemDragCandidate | null>(null);
+  const activeCustomItemDragRef = useRef<CustomItemDragState | null>(null);
+  const gridReorderDropStateRef = useRef<GridReorderDropTarget | null>(null);
+  const suppressNextItemClickRef = useRef(0);
   const descriptionDraftByItemIdRef = useRef<Map<string, string>>(new Map());
   const [descriptionPersistRequest, setDescriptionPersistRequest] = useState<{
     itemId: string;
@@ -766,6 +1258,27 @@ function App() {
     selectedCollectionId !== null
       ? collectionPathById.get(selectedCollectionId) ?? "All Items"
       : "All Items";
+
+  const reloadItemsFromDb = useCallback(
+    async (collectionsOverride?: Collection[]) => {
+      const persistedState = await loadDbAppState();
+      const activeCollections = collectionsOverride ?? collections;
+      const pathById = buildCollectionPathMap(activeCollections);
+      const collectionItemsByItemId = buildCollectionItemsByItemId(
+        persistedState.collectionItems ?? [],
+      );
+      const mappedItems = persistedState.items.map((item) =>
+        mapDbItemToItem({
+          item,
+          collectionItemsByItemId,
+          collectionPathById: pathById,
+          thumbsRoot: thumbsRootRef.current,
+        }),
+      );
+      setItems(mappedItems);
+    },
+    [collections],
+  );
 
   useEffect(() => {
     try {
@@ -880,7 +1393,9 @@ function App() {
     (collectionId: string) => {
       const subtreeIds = collectCollectionSubtreeIds(collections, collectionId);
       const itemsCount = items.reduce((count, item) => {
-        if (item.collectionId && subtreeIds.has(item.collectionId)) {
+        const hasSubtreeMembership = item.collectionIds.some((id) => subtreeIds.has(id));
+        const hasOutsideMembership = item.collectionIds.some((id) => !subtreeIds.has(id));
+        if (hasSubtreeMembership && !hasOutsideMembership) {
           return count + 1;
         }
         return count;
@@ -916,6 +1431,14 @@ function App() {
     if (!pendingDelete) return;
 
     const { collectionId } = pendingDelete;
+    const collectionsSnapshot = [...collections];
+    const itemsSnapshot = [...items];
+    const selectedCollectionIdSnapshot = selectedCollectionId;
+    const selectedIdsSnapshot = [...selectedIds];
+    const selectionAnchorIdSnapshot = selectionAnchorId;
+    const descriptionPersistRequestSnapshot = descriptionPersistRequest
+      ? { ...descriptionPersistRequest }
+      : null;
     const targetCollection = collections.find((collection) => collection.id === collectionId);
     if (!targetCollection) {
       setDeleteCollectionConfirm(null);
@@ -923,15 +1446,21 @@ function App() {
     }
 
     const { subtreeIds } = getCollectionDeleteImpact(collectionId);
-    const removedItems = items.filter(
-      (item) => item.collectionId !== null && subtreeIds.has(item.collectionId),
-    );
+    const removedItems = items.filter((item) => {
+      const hasSubtreeMembership = item.collectionIds.some((id) => subtreeIds.has(id));
+      const hasOutsideMembership = item.collectionIds.some((id) => !subtreeIds.has(id));
+      return hasSubtreeMembership && !hasOutsideMembership;
+    });
     const removedItemIds = new Set(removedItems.map((item) => item.id));
+    const nextCollectionPathById = new Map<string, string>();
 
     setIsActionInProgress(true);
     try {
       await deleteCollectionInDb(collectionId);
       const refreshedCollections = await getAllCollectionsInDb();
+      buildCollectionPathMap(refreshedCollections).forEach((value, key) => {
+        nextCollectionPathById.set(key, value);
+      });
       setCollections(refreshedCollections);
       setSelectedCollectionId((currentSelectedCollectionId) => {
         if (!currentSelectedCollectionId) return currentSelectedCollectionId;
@@ -957,36 +1486,142 @@ function App() {
 
     setDeleteCollectionConfirm(null);
     if (removedItemIds.size === 0) {
-      return;
+      setItems((currentItems) =>
+        currentItems.map((item) => {
+          const hasSubtreeMembership = item.collectionIds.some((id) => subtreeIds.has(id));
+          if (!hasSubtreeMembership) {
+            return item;
+          }
+          let nextItem = item;
+          item.collectionIds.forEach((membershipCollectionId) => {
+            if (!subtreeIds.has(membershipCollectionId)) {
+              return;
+            }
+            nextItem = removeCollectionMembershipFromItem({
+              item: nextItem,
+              collectionId: membershipCollectionId,
+              collectionPathById: nextCollectionPathById,
+            });
+          });
+          return nextItem;
+        }),
+      );
+    } else {
+      setItems((currentItems) =>
+        currentItems
+          .filter((item) => !removedItemIds.has(item.id))
+          .map((item) => {
+            const hasSubtreeMembership = item.collectionIds.some((id) => subtreeIds.has(id));
+            if (!hasSubtreeMembership) {
+              return item;
+            }
+            let nextItem = item;
+            item.collectionIds.forEach((membershipCollectionId) => {
+              if (!subtreeIds.has(membershipCollectionId)) {
+                return;
+              }
+              nextItem = removeCollectionMembershipFromItem({
+                item: nextItem,
+                collectionId: membershipCollectionId,
+                collectionPathById: nextCollectionPathById,
+              });
+            });
+            return nextItem;
+          }),
+      );
+      setSelectedIds((currentSelectedIds) =>
+        currentSelectedIds.filter((itemId) => !removedItemIds.has(itemId)),
+      );
+      setSelectionAnchorId((currentAnchorId) =>
+        currentAnchorId !== null && removedItemIds.has(currentAnchorId) ? null : currentAnchorId,
+      );
+      setDescriptionPersistRequest((current) =>
+        current && removedItemIds.has(current.itemId) ? null : current,
+      );
+    }
+    const finalizeRemovedItemsCleanup = () => {
+      removedItems.forEach((item) => {
+        const previewUrl = transientPreviewUrlByItemIdRef.current.get(item.id);
+        if (previewUrl) {
+          transientPreviewUrlByItemIdRef.current.delete(item.id);
+          if (previewUrl.startsWith("blob:")) {
+            URL.revokeObjectURL(previewUrl);
+          }
+        }
+        descriptionDraftByItemIdRef.current.delete(item.id);
+      });
+    };
+
+    if (snackbarInfoTimeoutRef.current !== null) {
+      window.clearTimeout(snackbarInfoTimeoutRef.current);
+      snackbarInfoTimeoutRef.current = null;
+    }
+    if (pendingUndoableActionRef.current) {
+      const pending = pendingUndoableActionRef.current;
+      pendingUndoableActionRef.current = null;
+      window.clearTimeout(pending.timeoutId);
+      setSnackbar((current) => (current?.id === pending.id ? null : current));
+      try {
+        await pending.commit();
+        pending.finalizeUi?.();
+      } catch (error) {
+        console.error("Failed to commit pending action before delete-collection snackbar:", error);
+        pending.undoUi();
+      }
     }
 
-    setItems((currentItems) =>
-      currentItems.filter((item) => !removedItemIds.has(item.id)),
-    );
-    setSelectedIds((currentSelectedIds) =>
-      currentSelectedIds.filter((itemId) => !removedItemIds.has(itemId)),
-    );
-    setSelectionAnchorId((currentAnchorId) =>
-      currentAnchorId !== null && removedItemIds.has(currentAnchorId) ? null : currentAnchorId,
-    );
-    setDescriptionPersistRequest((current) =>
-      current && removedItemIds.has(current.itemId) ? null : current,
-    );
-    removedItems.forEach((item) => {
-      const previewUrl = transientPreviewUrlByItemIdRef.current.get(item.id);
-      if (previewUrl) {
-        transientPreviewUrlByItemIdRef.current.delete(item.id);
-        if (previewUrl.startsWith("blob:")) {
-          URL.revokeObjectURL(previewUrl);
-        }
+    const deleteCollectionSnackbarId = ++snackbarSequenceRef.current;
+    const deleteCollectionTimeoutId = window.setTimeout(() => {
+      const pending = pendingUndoableActionRef.current;
+      if (!pending || pending.id !== deleteCollectionSnackbarId) {
+        return;
       }
-      descriptionDraftByItemIdRef.current.delete(item.id);
+      pendingUndoableActionRef.current = null;
+      window.clearTimeout(pending.timeoutId);
+      setSnackbar((current) => (current?.id === pending.id ? null : current));
+      void pending
+        .commit()
+        .then(() => {
+          pending.finalizeUi?.();
+        })
+        .catch((error) => {
+          console.error("Delete collection snackbar finalize failed:", error);
+          pending.undoUi();
+        });
+    }, UNDO_SNACKBAR_TIMEOUT_MS);
+
+    pendingUndoableActionRef.current = {
+      id: deleteCollectionSnackbarId,
+      commit: async () => {},
+      undoUi: () => {
+        setCollections(collectionsSnapshot);
+        setItems(itemsSnapshot);
+        setSelectedCollectionId(selectedCollectionIdSnapshot);
+        setSelectedIds(selectedIdsSnapshot);
+        setSelectionAnchorId(selectionAnchorIdSnapshot);
+        setDescriptionPersistRequest(descriptionPersistRequestSnapshot);
+        setDeleteCollectionConfirm(null);
+      },
+      finalizeUi: finalizeRemovedItemsCleanup,
+      timeoutId: deleteCollectionTimeoutId,
+    };
+
+    setSnackbar({
+      id: deleteCollectionSnackbarId,
+      message: `Deleted collection "${targetCollection.name}" (${pendingDelete.itemsCount} items, ${pendingDelete.subcollectionsCount} sub-collections)`,
+      actionKind: "delete",
+      visibleUntil: Date.now() + UNDO_SNACKBAR_TIMEOUT_MS,
+      canUndo: true,
     });
   }, [
     deleteCollectionConfirm,
     collections,
     items,
     getCollectionDeleteImpact,
+    selectedCollectionId,
+    selectedIds,
+    selectionAnchorId,
+    descriptionPersistRequest,
   ]);
 
   const handleConfirmDeleteCollection = useCallback(() => {
@@ -1665,6 +2300,118 @@ function App() {
     setContextMenu((current) => ({ ...current, open: false, itemId: null }));
   }, []);
 
+  const commitPendingUndoableAction = useCallback(async () => {
+    const pending = pendingUndoableActionRef.current;
+    if (!pending) {
+      return false;
+    }
+
+    pendingUndoableActionRef.current = null;
+    window.clearTimeout(pending.timeoutId);
+    setSnackbar((current) => (current?.id === pending.id ? null : current));
+
+    try {
+      await pending.commit();
+      pending.finalizeUi?.();
+      return true;
+    } catch (error) {
+      console.error("Failed to commit pending undoable action:", error);
+      pending.undoUi();
+      return false;
+    }
+  }, []);
+
+  const enqueueUndoableSnackbarAction = useCallback(
+    async (args: {
+      message: string;
+      actionKind: UndoableSnackbarActionKind;
+      commit: () => Promise<void>;
+      undoUi: () => void;
+      finalizeUi?: () => void;
+      skipCommitPending?: boolean;
+    }) => {
+      if (!args.skipCommitPending) {
+        await commitPendingUndoableAction();
+      }
+      if (snackbarInfoTimeoutRef.current !== null) {
+        window.clearTimeout(snackbarInfoTimeoutRef.current);
+        snackbarInfoTimeoutRef.current = null;
+      }
+
+      const id = ++snackbarSequenceRef.current;
+      const visibleUntil = Date.now() + UNDO_SNACKBAR_TIMEOUT_MS;
+      const timeoutId = window.setTimeout(() => {
+        const pending = pendingUndoableActionRef.current;
+        if (!pending || pending.id !== id) {
+          return;
+        }
+        void commitPendingUndoableAction();
+      }, UNDO_SNACKBAR_TIMEOUT_MS);
+
+      pendingUndoableActionRef.current = {
+        id,
+        commit: args.commit,
+        undoUi: args.undoUi,
+        finalizeUi: args.finalizeUi,
+        timeoutId,
+      };
+      setSnackbar({
+        id,
+        message: args.message,
+        actionKind: args.actionKind,
+        visibleUntil,
+        canUndo: true,
+      });
+    },
+    [commitPendingUndoableAction],
+  );
+
+  const showInfoSnackbar = useCallback(
+    async (args: {
+      message: string;
+      actionKind?: UndoableSnackbarActionKind;
+      timeoutMs?: number;
+      skipCommitPending?: boolean;
+    }) => {
+      if (!args.skipCommitPending) {
+        await commitPendingUndoableAction();
+      }
+      if (snackbarInfoTimeoutRef.current !== null) {
+        window.clearTimeout(snackbarInfoTimeoutRef.current);
+        snackbarInfoTimeoutRef.current = null;
+      }
+
+      const id = ++snackbarSequenceRef.current;
+      const timeoutMs = args.timeoutMs ?? UNDO_SNACKBAR_TIMEOUT_MS;
+      const visibleUntil = Date.now() + timeoutMs;
+      setSnackbar({
+        id,
+        message: args.message,
+        actionKind: args.actionKind ?? "move",
+        visibleUntil,
+        canUndo: false,
+      });
+
+      snackbarInfoTimeoutRef.current = window.setTimeout(() => {
+        setSnackbar((current) => (current?.id === id ? null : current));
+        snackbarInfoTimeoutRef.current = null;
+      }, timeoutMs);
+    },
+    [commitPendingUndoableAction],
+  );
+
+  const handleUndoSnackbar = useCallback(() => {
+    const pending = pendingUndoableActionRef.current;
+    if (!pending) {
+      setSnackbar(null);
+      return;
+    }
+    pendingUndoableActionRef.current = null;
+    window.clearTimeout(pending.timeoutId);
+    pending.undoUi();
+    setSnackbar((current) => (current?.id === pending.id ? null : current));
+  }, []);
+
   const normalizeTargetItemIds = useCallback((itemIds: string[]): string[] => {
     const deduped = Array.from(new Set(itemIds));
     if (deduped.length === 0) return [];
@@ -1685,27 +2432,17 @@ function App() {
       const idsToDelete = new Set(itemIds);
       if (idsToDelete.size === 0) return;
 
-      const removedItems = items.filter((item) => idsToDelete.has(item.id));
+      const removedItems = itemsRef.current.filter((item) => idsToDelete.has(item.id));
       if (removedItems.length === 0) return;
 
-      setIsActionInProgress(true);
-      try {
-        console.log("Delete action requested:", Array.from(idsToDelete));
-        const deleteResult = await deleteItemsByIdsWithCleanupInDb(Array.from(idsToDelete));
-        console.log("Delete action rows removed:", deleteResult.deletedRows);
-        deleteResult.cleanup.forEach((entry) => {
-          console.log(
-            "Vault cleanup:",
-            entry.vaultKey,
-            entry.deletedFromDisk ? "deleted" : "deferred-or-missing",
-          );
-        });
-      } catch (error) {
-        console.error("Failed to delete selected items:", error);
-        return;
-      } finally {
-        setIsActionInProgress(false);
-      }
+      const removedItemsById = new Map(removedItems.map((item) => [item.id, item] as const));
+      const previousSelectedIds = [...selectedIds];
+      const previousSelectionAnchorId = selectionAnchorId;
+      const previousDescriptionPersistRequest = descriptionPersistRequest
+        ? { ...descriptionPersistRequest }
+        : null;
+
+      await commitPendingUndoableAction();
 
       setItems((currentItems) => currentItems.filter((item) => !idsToDelete.has(item.id)));
       setSelectedIds((currentSelectedIds) =>
@@ -1717,20 +2454,69 @@ function App() {
       setDescriptionPersistRequest((current) =>
         current && idsToDelete.has(current.itemId) ? null : current,
       );
-      removedItems.forEach((item) => {
-        releaseTransientPreviewUrl(item.id);
-        descriptionDraftByItemIdRef.current.delete(item.id);
+
+      const count = removedItems.length;
+      await enqueueUndoableSnackbarAction({
+        actionKind: "delete",
+        message: count === 1 ? "Deleted 1 item" : `Deleted ${count} items`,
+        skipCommitPending: true,
+        commit: async () => {
+          setIsActionInProgress(true);
+          try {
+            console.log("Delete action requested:", Array.from(idsToDelete));
+            const deleteResult = await deleteItemsByIdsWithCleanupInDb(Array.from(idsToDelete));
+            console.log("Delete action rows removed:", deleteResult.deletedRows);
+            deleteResult.cleanup.forEach((entry) => {
+              console.log(
+                "Vault cleanup:",
+                entry.vaultKey,
+                entry.deletedFromDisk ? "deleted" : "deferred-or-missing",
+              );
+            });
+          } finally {
+            setIsActionInProgress(false);
+          }
+        },
+        undoUi: () => {
+          setItems((currentItems) => {
+            const existingIds = new Set(currentItems.map((item) => item.id));
+            const restoredItems = removedItems.filter((item) => !existingIds.has(item.id));
+            return restoredItems.length > 0 ? [...restoredItems, ...currentItems] : currentItems;
+          });
+          setSelectedIds(previousSelectedIds);
+          setSelectionAnchorId(previousSelectionAnchorId);
+          setDescriptionPersistRequest(previousDescriptionPersistRequest);
+        },
+        finalizeUi: () => {
+          removedItemsById.forEach((item) => {
+            releaseTransientPreviewUrl(item.id);
+            descriptionDraftByItemIdRef.current.delete(item.id);
+          });
+        },
       });
     },
-    [items, releaseTransientPreviewUrl],
+    [
+      selectedIds,
+      selectionAnchorId,
+      descriptionPersistRequest,
+      releaseTransientPreviewUrl,
+      enqueueUndoableSnackbarAction,
+      commitPendingUndoableAction,
+    ],
   );
 
   const duplicateItemsById = useCallback(
-    async (itemIds: string[]) => {
+    async (
+      itemIds: string[],
+      options?: {
+        targetCollectionId?: string | null;
+        closeContextMenu?: boolean;
+      },
+    ): Promise<Item[] | null> => {
       const targetIds = new Set(normalizeTargetItemIds(itemIds));
-      if (targetIds.size === 0) return;
-      const sourceItems = items.filter((item) => targetIds.has(item.id));
-      if (sourceItems.length === 0) return;
+      if (targetIds.size === 0) return null;
+      const sourceItems = itemsRef.current.filter((item) => targetIds.has(item.id));
+      if (sourceItems.length === 0) return null;
 
       setIsActionInProgress(true);
       const duplicatedItems: Item[] = [];
@@ -1738,14 +2524,42 @@ function App() {
         for (const [index, sourceItem] of sourceItems.entries()) {
           const duplicatedId = createItemId();
           const timestampMs = Date.now() + index;
+          const selectedContextCollectionId =
+            selectedCollectionId &&
+            sourceItem.collectionIds.includes(selectedCollectionId)
+              ? selectedCollectionId
+              : null;
+          const preferredTargetCollectionId =
+            options?.targetCollectionId &&
+            sourceItem.collectionIds.includes(options.targetCollectionId)
+              ? options.targetCollectionId
+              : null;
+          const primaryCollectionId =
+            preferredTargetCollectionId ?? selectedContextCollectionId ?? sourceItem.collectionId;
+          const duplicatedCollectionInstancesByCollectionId =
+            primaryCollectionId !== null &&
+            sourceItem.collectionInstancesByCollectionId[primaryCollectionId]
+              ? {
+                  [primaryCollectionId]: {
+                    ...sourceItem.collectionInstancesByCollectionId[primaryCollectionId],
+                    instanceId: createCollectionMembershipInstanceId(),
+                    collectionId: primaryCollectionId,
+                    sortIndex: timestampMs,
+                    createdAt: timestampMs,
+                  },
+                }
+              : {};
           const duplicatedItem: Item = {
             ...sourceItem,
             id: duplicatedId,
             createdAt: formatDateFromTimestampMs(timestampMs),
             updatedAt: formatDateFromTimestampMs(timestampMs),
+            collectionId: primaryCollectionId,
+            collectionIds: primaryCollectionId ? [primaryCollectionId] : [],
+            collectionInstancesByCollectionId: duplicatedCollectionInstancesByCollectionId,
             collectionPath:
-              sourceItem.collectionId !== null
-                ? collectionPathById.get(sourceItem.collectionId) ?? "All Items"
+              primaryCollectionId !== null
+                ? collectionPathById.get(primaryCollectionId) ?? "All Items"
                 : "All Items",
           };
 
@@ -1760,19 +2574,294 @@ function App() {
         }
       } catch (error) {
         console.error("Failed to duplicate selected items:", error);
-        return;
+        return null;
       } finally {
         setIsActionInProgress(false);
       }
 
-      if (duplicatedItems.length === 0) return;
+      if (duplicatedItems.length === 0) return null;
       console.log("Duplicate action created item ids:", duplicatedItems.map((item) => item.id));
       setItems((currentItems) => [...duplicatedItems, ...currentItems]);
       setSelectedIds(duplicatedItems.map((item) => item.id));
       setSelectionAnchorId(duplicatedItems[duplicatedItems.length - 1]?.id ?? null);
-      closeContextMenu();
+      void showInfoSnackbar({
+        actionKind: "duplicate",
+        message:
+          duplicatedItems.length === 1
+            ? "Duplicated 1 item"
+            : `Duplicated ${duplicatedItems.length} items`,
+      });
+      if (options?.closeContextMenu !== false) {
+        closeContextMenu();
+      }
+      return duplicatedItems;
     },
-    [items, normalizeTargetItemIds, collectionPathById, closeContextMenu],
+    [normalizeTargetItemIds, collectionPathById, showInfoSnackbar, closeContextMenu, selectedCollectionId],
+  );
+
+  const applyCollectionMembershipTransfer = useCallback(
+    async (params: {
+      itemIds: string[];
+      sourceCollectionId: string | null;
+      targetCollectionId: string | null;
+      mode: "move" | "duplicate";
+    }): Promise<boolean> => {
+      const normalizedTargetIds = normalizeTargetItemIds(params.itemIds);
+      if (normalizedTargetIds.length === 0) {
+        return false;
+      }
+
+      if (
+        params.mode === "move" &&
+        params.sourceCollectionId !== null &&
+        params.sourceCollectionId === params.targetCollectionId
+      ) {
+        return false;
+      }
+
+      if (params.mode === "duplicate" && params.targetCollectionId === null) {
+        return false;
+      }
+
+      const targetIdSet = new Set(normalizedTargetIds);
+      const currentItems = itemsRef.current;
+      const optimisticUpdatedAt = formatDateFromTimestampMs(Date.now());
+      const nextItemById = new Map<string, Item>();
+      const snapshotsByItemId = new Map<string, ItemMembershipUiSnapshot>();
+
+      currentItems.forEach((item) => {
+        if (!targetIdSet.has(item.id)) {
+          return;
+        }
+
+        const nextItem =
+          params.mode === "duplicate" && params.targetCollectionId !== null
+            ? addCollectionMembershipToItem({
+                item,
+                collectionId: params.targetCollectionId,
+                collectionPathById,
+                preservePrimary: true,
+                updatedAt: optimisticUpdatedAt,
+              })
+            : moveCollectionMembershipOnItem({
+                item,
+                sourceCollectionId: params.sourceCollectionId,
+                targetCollectionId: params.targetCollectionId,
+                collectionPathById,
+                updatedAt: optimisticUpdatedAt,
+              });
+
+        if (nextItem === item) {
+          return;
+        }
+
+        snapshotsByItemId.set(item.id, createItemMembershipSnapshot(item));
+        nextItemById.set(item.id, nextItem);
+      });
+
+      if (nextItemById.size === 0) {
+        return false;
+      }
+
+      const changedItemIds = Array.from(nextItemById.keys());
+      const changedCount = changedItemIds.length;
+      const changedItemIdSet = new Set(changedItemIds);
+      const targetCollectionName =
+        params.targetCollectionId !== null
+          ? collections.find((collection) => collection.id === params.targetCollectionId)?.name ??
+            "Collection"
+          : null;
+      const sourceCollectionName =
+        params.sourceCollectionId !== null
+          ? collections.find((collection) => collection.id === params.sourceCollectionId)?.name ??
+            "Collection"
+          : null;
+
+      const actionKind: UndoableSnackbarActionKind =
+        params.mode === "duplicate"
+          ? "duplicate"
+          : params.targetCollectionId === null
+            ? "remove"
+            : "move";
+      const message =
+        params.mode === "duplicate"
+          ? changedCount === 1
+            ? `Added 1 item to "${targetCollectionName}"`
+            : `Added ${changedCount} items to "${targetCollectionName}"`
+          : params.targetCollectionId === null
+            ? changedCount === 1
+              ? `Removed 1 item from "${sourceCollectionName ?? "Collection"}"`
+              : `Removed ${changedCount} items from "${sourceCollectionName ?? "Collection"}"`
+            : changedCount === 1
+              ? `Moved 1 item to "${targetCollectionName}"`
+              : `Moved ${changedCount} items to "${targetCollectionName}"`;
+
+      const moveUndoAddBackToSourceIds: string[] = [];
+      const moveUndoMoveBackIds: string[] = [];
+      const moveUndoRemoveFromTargetIds: string[] = [];
+      const duplicateUndoRemoveFromTargetIds: string[] = [];
+
+      if (params.mode === "duplicate" && params.targetCollectionId !== null) {
+        currentItems.forEach((item) => {
+          if (changedItemIdSet.has(item.id)) {
+            duplicateUndoRemoveFromTargetIds.push(item.id);
+          }
+        });
+      } else {
+        currentItems.forEach((item) => {
+          if (!changedItemIdSet.has(item.id)) return;
+          const hadSource =
+            params.sourceCollectionId !== null &&
+            item.collectionIds.includes(params.sourceCollectionId);
+          const hadTarget =
+            params.targetCollectionId !== null &&
+            item.collectionIds.includes(params.targetCollectionId);
+
+          if (params.sourceCollectionId === null && params.targetCollectionId !== null) {
+            moveUndoRemoveFromTargetIds.push(item.id);
+            return;
+          }
+
+          if (params.targetCollectionId === null && params.sourceCollectionId !== null) {
+            moveUndoAddBackToSourceIds.push(item.id);
+            return;
+          }
+
+          if (params.sourceCollectionId !== null && params.targetCollectionId !== null) {
+            if (hadTarget) {
+              // Move collapsed an existing duplicate target membership by removing the source membership.
+              moveUndoAddBackToSourceIds.push(item.id);
+            } else if (hadSource) {
+              moveUndoMoveBackIds.push(item.id);
+            }
+          }
+        });
+      }
+
+      await commitPendingUndoableAction();
+
+      setItems((itemsState) =>
+        itemsState.map((item) => nextItemById.get(item.id) ?? item),
+      );
+
+      setIsActionInProgress(true);
+      try {
+        if (params.mode === "duplicate" && params.targetCollectionId !== null) {
+          await addItemsToCollectionInDb(changedItemIds, params.targetCollectionId);
+        } else {
+          await moveCollectionItemMembershipsInDb({
+            itemIds: changedItemIds,
+            sourceCollectionId: params.sourceCollectionId,
+            targetCollectionId: params.targetCollectionId,
+          });
+        }
+        await reloadItemsFromDb();
+      } catch (error) {
+        console.error("Failed to update collection memberships:", error);
+        setItems((itemsState) =>
+          itemsState.map((item) => {
+            const snapshot = snapshotsByItemId.get(item.id);
+            return snapshot ? restoreItemMembershipSnapshot(item, snapshot) : item;
+          }),
+        );
+        return false;
+      } finally {
+        setIsActionInProgress(false);
+      }
+
+      await enqueueUndoableSnackbarAction({
+        message,
+        actionKind,
+        skipCommitPending: true,
+        commit: async () => {},
+        undoUi: () => {
+          setItems((itemsState) =>
+            itemsState.map((item) => {
+              const snapshot = snapshotsByItemId.get(item.id);
+              return snapshot ? restoreItemMembershipSnapshot(item, snapshot) : item;
+            }),
+          );
+
+          void (async () => {
+            setIsActionInProgress(true);
+            try {
+              if (
+                params.mode === "duplicate" &&
+                params.targetCollectionId !== null &&
+                duplicateUndoRemoveFromTargetIds.length > 0
+              ) {
+                await moveCollectionItemMembershipsInDb({
+                  itemIds: duplicateUndoRemoveFromTargetIds,
+                  sourceCollectionId: params.targetCollectionId,
+                  targetCollectionId: null,
+                });
+              } else {
+                if (
+                  params.targetCollectionId !== null &&
+                  params.sourceCollectionId !== null &&
+                  moveUndoMoveBackIds.length > 0
+                ) {
+                  await moveCollectionItemMembershipsInDb({
+                    itemIds: moveUndoMoveBackIds,
+                    sourceCollectionId: params.targetCollectionId,
+                    targetCollectionId: params.sourceCollectionId,
+                  });
+                }
+                if (params.sourceCollectionId !== null && moveUndoAddBackToSourceIds.length > 0) {
+                  await addItemsToCollectionInDb(moveUndoAddBackToSourceIds, params.sourceCollectionId);
+                }
+                if (
+                  params.targetCollectionId !== null &&
+                  moveUndoRemoveFromTargetIds.length > 0
+                ) {
+                  await moveCollectionItemMembershipsInDb({
+                    itemIds: moveUndoRemoveFromTargetIds,
+                    sourceCollectionId: params.targetCollectionId,
+                    targetCollectionId: null,
+                  });
+                }
+              }
+              await reloadItemsFromDb();
+            } catch (error) {
+              console.error("Failed to undo collection membership transfer:", error);
+              void reloadItemsFromDb().catch((reloadError) => {
+                console.error("Failed to reload items after undo error:", reloadError);
+              });
+            } finally {
+              setIsActionInProgress(false);
+            }
+          })();
+        },
+      });
+
+      return true;
+    },
+    [
+      normalizeTargetItemIds,
+      collectionPathById,
+      collections,
+      commitPendingUndoableAction,
+      enqueueUndoableSnackbarAction,
+      reloadItemsFromDb,
+    ],
+  );
+
+  const handleCollectionMembershipDrop = useCallback(
+    async (args: {
+      itemIds: string[];
+      sourceCollectionId: string | null;
+      targetCollectionId: string;
+      op: "move" | "duplicate";
+    }) => {
+      console.log("[dnd][drop][handle]", args);
+      await applyCollectionMembershipTransfer({
+        itemIds: args.itemIds,
+        sourceCollectionId: args.sourceCollectionId,
+        targetCollectionId: args.targetCollectionId,
+        mode: args.op,
+      });
+    },
+    [applyCollectionMembershipTransfer],
   );
 
   const requestMoveItems = useCallback(
@@ -1789,42 +2878,26 @@ function App() {
       const targetIds = normalizeTargetItemIds(moveTargetItemIds);
       if (targetIds.length === 0) return;
 
-      setIsActionInProgress(true);
-      try {
-        const updateResult = await moveItemsToCollectionInDb(targetIds, collectionId);
-        const nextCollectionPath =
-          collectionId !== null ? collectionPathById.get(collectionId) ?? "All Items" : "All Items";
-        setItems((currentItems) =>
-          currentItems.map((item) =>
-            targetIds.includes(item.id)
-              ? {
-                  ...item,
-                  collectionId,
-                  collectionPath: nextCollectionPath,
-                  updatedAt: formatDateFromTimestampMs(updateResult.updatedAt),
-                }
-              : item,
-          ),
-        );
-        console.log(
-          "Move action:",
-          targetIds,
-          "target collection:",
-          collectionId,
-          "updated rows:",
-          updateResult.updatedRows,
-        );
-      } catch (error) {
-        console.error("Failed to move selected items:", error);
+      const moved = await applyCollectionMembershipTransfer({
+        itemIds: targetIds,
+        sourceCollectionId: selectedCollectionId,
+        targetCollectionId: collectionId,
+        mode: "move",
+      });
+      if (!moved) {
+        setMoveTargetItemIds([]);
         return;
-      } finally {
-        setIsActionInProgress(false);
       }
-
       setMoveTargetItemIds([]);
       closeContextMenu();
     },
-    [moveTargetItemIds, normalizeTargetItemIds, collectionPathById, closeContextMenu],
+    [
+      moveTargetItemIds,
+      normalizeTargetItemIds,
+      applyCollectionMembershipTransfer,
+      selectedCollectionId,
+      closeContextMenu,
+    ],
   );
 
   const markImportAsError = useCallback((itemId: string, error: unknown) => {
@@ -2120,9 +3193,13 @@ function App() {
 
         const collectionRows = loadedCollections;
         const pathById = buildCollectionPathMap(collectionRows);
+        const collectionItemsByItemId = buildCollectionItemsByItemId(
+          persistedState.collectionItems ?? [],
+        );
         const mappedItems = persistedState.items.map((item) =>
           mapDbItemToItem({
             item,
+            collectionItemsByItemId,
             collectionPathById: pathById,
             thumbsRoot,
           }),
@@ -2207,6 +3284,14 @@ function App() {
       importSourceByItemIdRef.current.clear();
       imageEvaluationQueueRef.current.dispose();
       imageThumbnailEvaluationRequestedRef.current.clear();
+      if (pendingUndoableActionRef.current) {
+        window.clearTimeout(pendingUndoableActionRef.current.timeoutId);
+        pendingUndoableActionRef.current = null;
+      }
+      if (snackbarInfoTimeoutRef.current !== null) {
+        window.clearTimeout(snackbarInfoTimeoutRef.current);
+        snackbarInfoTimeoutRef.current = null;
+      }
       if (userInteractionTimeoutRef.current !== null) {
         window.clearTimeout(userInteractionTimeoutRef.current);
         userInteractionTimeoutRef.current = null;
@@ -2351,36 +3436,50 @@ function App() {
   }, [contextMenu.open, closeContextMenu]);
 
   useEffect(() => {
-    let isActive = true;
-    let unlisten: (() => void) | undefined;
+    let isCancelled = false;
+    let unlisten: (() => void) | null = null;
 
-    const setupNativeDrop = async () => {
+    void (async () => {
       try {
-        const unlistenFromApi = await getCurrentWindow().onDragDropEvent((event) => {
-          if (event.payload.type !== "drop") return;
-          if (event.payload.paths.length === 0) return;
-          void importPathsToVault(event.payload.paths);
+        unlisten = await getCurrentWindow().onDragDropEvent((event) => {
+          if (isCancelled) return;
+
+          const payload = event.payload;
+          if (payload.type === "enter" || payload.type === "over") {
+            setNativeDropEnabled(true);
+            return;
+          }
+
+          if (payload.type === "leave") {
+            setNativeDropEnabled(false);
+            return;
+          }
+
+          if (payload.type === "drop") {
+            setNativeDropEnabled(true);
+            void (async () => {
+              try {
+                const droppedPaths = payload.paths.filter((path) => path.trim().length > 0);
+                if (droppedPaths.length === 0) return;
+                await importPathsToVault(droppedPaths);
+              } catch (error) {
+                console.error("Native file drop import failed:", error);
+              } finally {
+                setNativeDropEnabled(false);
+              }
+            })();
+          }
         });
-
-        if (!isActive) {
-          unlistenFromApi();
-          return;
-        }
-
-        unlisten = unlistenFromApi;
-        setNativeDropEnabled(true);
+        console.info("[dnd] Native Tauri file drag-drop listener enabled.");
       } catch (error) {
-        if (isActive) {
-          setNativeDropEnabled(false);
-        }
-        console.warn("Native Tauri drag-drop listener unavailable:", error);
+        console.warn("Native Tauri file drag-drop listener unavailable; using DOM drop fallback:", error);
+        setNativeDropEnabled(false);
       }
-    };
-
-    void setupNativeDrop();
+    })();
 
     return () => {
-      isActive = false;
+      isCancelled = true;
+      setNativeDropEnabled(false);
       if (unlisten) {
         unlisten();
       }
@@ -2459,7 +3558,25 @@ function App() {
 
   const scopedItems = useMemo(() => {
     if (!selectedCollectionId) return items;
-    return items.filter((item) => item.collectionId === selectedCollectionId);
+    return items
+      .filter((item) => item.collectionIds.includes(selectedCollectionId))
+      .slice()
+      .sort((left, right) => {
+        const leftMembership = left.collectionInstancesByCollectionId[selectedCollectionId];
+        const rightMembership = right.collectionInstancesByCollectionId[selectedCollectionId];
+        const leftSortKey = leftMembership?.sortIndex ?? leftMembership?.createdAt ?? Number.MAX_SAFE_INTEGER;
+        const rightSortKey =
+          rightMembership?.sortIndex ?? rightMembership?.createdAt ?? Number.MAX_SAFE_INTEGER;
+        if (leftSortKey !== rightSortKey) {
+          return leftSortKey - rightSortKey;
+        }
+        const leftCreatedAt = leftMembership?.createdAt ?? 0;
+        const rightCreatedAt = rightMembership?.createdAt ?? 0;
+        if (leftCreatedAt !== rightCreatedAt) {
+          return leftCreatedAt - rightCreatedAt;
+        }
+        return left.id.localeCompare(right.id);
+      });
   }, [items, selectedCollectionId]);
 
   const tags = useMemo(() => {
@@ -2495,7 +3612,20 @@ function App() {
 
   const selectedItem =
     selectedIds.length === 1
-      ? items.find((item) => item.id === selectedIds[0]) ?? null
+      ? (() => {
+          const foundItem = items.find((item) => item.id === selectedIds[0]) ?? null;
+          if (
+            !foundItem ||
+            selectedCollectionId === null ||
+            !foundItem.collectionIds.includes(selectedCollectionId)
+          ) {
+            return foundItem;
+          }
+          return {
+            ...foundItem,
+            collectionPath: collectionPathById.get(selectedCollectionId) ?? foundItem.collectionPath,
+          };
+        })()
       : null;
 
   const modalItem =
@@ -2508,6 +3638,13 @@ function App() {
       : null;
 
   const handleSelectItem = (itemId: string, event: React.MouseEvent) => {
+    if (Date.now() < suppressNextItemClickRef.current) {
+      suppressNextItemClickRef.current = 0;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
     const filteredIds = filteredItems.map((item) => item.id);
     const isToggle = event.ctrlKey || event.metaKey;
 
@@ -2548,6 +3685,615 @@ function App() {
     setSelectedIds([itemId]);
     setSelectionAnchorId(itemId);
   };
+
+  const handleItemGridEmptyAreaClick = useCallback((event: React.MouseEvent<HTMLElement>) => {
+    if (Date.now() < suppressNextItemClickRef.current) {
+      suppressNextItemClickRef.current = 0;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    setSelectedIds([]);
+    setSelectionAnchorId(null);
+  }, []);
+
+  const setActiveCustomItemDrag = useCallback((nextState: CustomItemDragState | null) => {
+    activeCustomItemDragRef.current = nextState;
+    setCustomItemDragState(nextState);
+  }, []);
+
+  const setGridReorderDropTarget = useCallback((nextState: GridReorderDropTarget | null) => {
+    gridReorderDropStateRef.current = nextState;
+    setGridReorderDropState(nextState);
+  }, []);
+
+  const clearPointerItemDrag = useCallback(() => {
+    pointerItemDragCandidateRef.current = null;
+    setActiveCustomItemDrag(null);
+    setGridReorderDropTarget(null);
+    activeItemDragPayloadRef.current = null;
+    activeItemDragAltRef.current = false;
+    setIsItemDragActive(false);
+    setSidebarCollectionDropState(null);
+  }, [setActiveCustomItemDrag, setGridReorderDropTarget]);
+
+  const handleItemPointerDown = useCallback(
+    (item: Item, event: React.PointerEvent<HTMLButtonElement>) => {
+      if (!event.isPrimary || event.button !== 0) {
+        return;
+      }
+      if (event.ctrlKey || event.metaKey || event.shiftKey) {
+        return;
+      }
+
+      const isInSelection = selectedIds.includes(item.id);
+      const dragItemIds = isInSelection ? normalizeTargetItemIds(selectedIds) : [item.id];
+      if (dragItemIds.length === 0) {
+        return;
+      }
+
+      if (!isInSelection) {
+        setSelectedIds([item.id]);
+        setSelectionAnchorId(item.id);
+      }
+
+      const sourceCollectionId =
+        selectedCollectionId !== null && item.collectionIds.includes(selectedCollectionId)
+          ? selectedCollectionId
+          : item.collectionId;
+
+      suppressNextItemClickRef.current = 0;
+      pointerItemDragCandidateRef.current = {
+        pointerId: event.pointerId,
+        itemIds: dragItemIds,
+        sourceCollectionId,
+        startX: event.clientX,
+        startY: event.clientY,
+      };
+      setActiveCustomItemDrag(null);
+      console.log("[dnd][custom][candidate]", {
+        itemId: item.id,
+        dragItemIds,
+        sourceCollectionId,
+        x: event.clientX,
+        y: event.clientY,
+      });
+    },
+    [selectedIds, normalizeTargetItemIds, selectedCollectionId, setActiveCustomItemDrag],
+  );
+
+  const reorderSingleItemWithinSelectedCollection = useCallback(
+    async (args: { draggedItemId: string; targetItemId: string; position: "before" | "after" }) => {
+      if (!selectedCollectionId) {
+        return false;
+      }
+      if (searchQuery.trim().length > 0) {
+        return false;
+      }
+
+      const orderedIds = scopedItems.map((item) => item.id);
+      const fromIndex = orderedIds.indexOf(args.draggedItemId);
+      const targetIndex = orderedIds.indexOf(args.targetItemId);
+      if (fromIndex === -1 || targetIndex === -1 || fromIndex === targetIndex) {
+        return false;
+      }
+
+      const nextOrderedIds = [...orderedIds];
+      const [draggedItemId] = nextOrderedIds.splice(fromIndex, 1);
+      let insertIndex = nextOrderedIds.indexOf(args.targetItemId);
+      if (insertIndex === -1) {
+        return false;
+      }
+      if (args.position === "after") {
+        insertIndex += 1;
+      }
+      nextOrderedIds.splice(insertIndex, 0, draggedItemId);
+
+      const noOp = nextOrderedIds.every((id, index) => id === orderedIds[index]);
+      if (noOp) {
+        return false;
+      }
+
+      setIsActionInProgress(true);
+      try {
+        await reorderCollectionItemsInDb(selectedCollectionId, nextOrderedIds);
+        await reloadItemsFromDb();
+        return true;
+      } catch (error) {
+        console.error("Failed to reorder items in collection:", error);
+        void reloadItemsFromDb().catch((reloadError) => {
+          console.error("Failed to reload items after reorder error:", reloadError);
+        });
+        return false;
+      } finally {
+        setIsActionInProgress(false);
+      }
+    },
+    [reloadItemsFromDb, scopedItems, searchQuery, selectedCollectionId],
+  );
+
+  const duplicateItemsIntoSelectedCollectionAtDrop = useCallback(
+    async (args: {
+      itemIds: string[];
+      reorderTarget?: GridReorderDropTarget | null;
+    }): Promise<boolean> => {
+      if (!selectedCollectionId) {
+        return false;
+      }
+      const duplicatedItems = await duplicateItemsById(args.itemIds, {
+        targetCollectionId: selectedCollectionId,
+        closeContextMenu: false,
+      });
+      if (!duplicatedItems || duplicatedItems.length === 0) {
+        return false;
+      }
+
+      if (
+        duplicatedItems.length !== 1 ||
+        !args.reorderTarget ||
+        searchQuery.trim().length > 0
+      ) {
+        return true;
+      }
+
+      const duplicatedItemId = duplicatedItems[0].id;
+      const orderedIds = scopedItems.map((item) => item.id);
+      const targetIndex = orderedIds.indexOf(args.reorderTarget.itemId);
+      if (targetIndex === -1) {
+        return true;
+      }
+      const nextOrderedIds = [...orderedIds];
+      let insertIndex = targetIndex;
+      if (args.reorderTarget.position === "after") {
+        insertIndex += 1;
+      }
+      nextOrderedIds.splice(insertIndex, 0, duplicatedItemId);
+
+      setIsActionInProgress(true);
+      try {
+        await reorderCollectionItemsInDb(selectedCollectionId, nextOrderedIds);
+        await reloadItemsFromDb();
+      } catch (error) {
+        console.error("Failed to place duplicated item in collection order:", error);
+        void reloadItemsFromDb().catch((reloadError) => {
+          console.error("Failed to reload items after duplicate-place error:", reloadError);
+        });
+      } finally {
+        setIsActionInProgress(false);
+      }
+      return true;
+    },
+    [duplicateItemsById, reloadItemsFromDb, scopedItems, searchQuery, selectedCollectionId],
+  );
+
+  useEffect(() => {
+    const DRAG_THRESHOLD_PX = 6;
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const candidate = pointerItemDragCandidateRef.current;
+      const active = activeCustomItemDragRef.current;
+      if (!candidate && !active) {
+        return;
+      }
+
+      const trackedPointerId = active?.pointerId ?? candidate?.pointerId;
+      if (trackedPointerId !== undefined && event.pointerId !== trackedPointerId) {
+        return;
+      }
+
+      if (event.buttons === 0) {
+        clearPointerItemDrag();
+        return;
+      }
+
+      let nextActive = active;
+      if (!nextActive && candidate) {
+        const distance = Math.hypot(event.clientX - candidate.startX, event.clientY - candidate.startY);
+        if (distance < DRAG_THRESHOLD_PX) {
+          return;
+        }
+
+        const payload: SidebarItemDragPayload = {
+          kind: "stumble-item-selection",
+          itemIds: candidate.itemIds,
+          sourceCollectionId: candidate.sourceCollectionId,
+          initiatedAt: Date.now(),
+        };
+        const initialMode: "move" | "duplicate" =
+          event.altKey || keyboardAltPressedRef.current ? "duplicate" : "move";
+        activeItemDragPayloadRef.current = payload;
+        activeItemDragAltRef.current = initialMode === "duplicate";
+        setIsItemDragActive(true);
+        pointerItemDragCandidateRef.current = null;
+        nextActive = {
+          pointerId: candidate.pointerId,
+          itemIds: candidate.itemIds,
+          sourceCollectionId: candidate.sourceCollectionId,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          targetCollectionId: null,
+          mode: initialMode,
+        };
+        console.log("[dnd][custom][dragstart]", {
+          itemIds: candidate.itemIds,
+          sourceCollectionId: candidate.sourceCollectionId,
+          altKey: initialMode === "duplicate",
+        });
+      }
+
+      if (!nextActive) {
+        return;
+      }
+
+      event.preventDefault();
+      const rawAltCopy = event.altKey || keyboardAltPressedRef.current;
+      const mode: "move" | "duplicate" =
+        rawAltCopy || nextActive.mode === "duplicate" ? "duplicate" : "move";
+      activeItemDragAltRef.current = mode === "duplicate";
+      const canUseGridDropTarget =
+        nextActive.itemIds.length === 1 &&
+        selectedCollectionId !== null &&
+        nextActive.sourceCollectionId === selectedCollectionId &&
+        searchQuery.trim().length === 0;
+      const reorderTarget = canUseGridDropTarget
+        ? itemGridReorderTargetFromPoint(event.clientX, event.clientY, nextActive.itemIds[0])
+        : null;
+
+      if (reorderTarget) {
+        const currentReorderTarget = gridReorderDropStateRef.current;
+        setGridReorderDropTarget(
+          currentReorderTarget?.itemId === reorderTarget.itemId &&
+            currentReorderTarget.position === reorderTarget.position
+            ? currentReorderTarget
+            : reorderTarget,
+        );
+        setSidebarCollectionDropState((current) => (current === null ? current : null));
+      } else {
+        setGridReorderDropTarget(null);
+      }
+
+      const targetCollectionId = reorderTarget
+        ? null
+        : collectionDropTargetIdFromPoint(event.clientX, event.clientY);
+
+      setSidebarCollectionDropState((current) => {
+        if (!targetCollectionId) {
+          return current === null ? current : null;
+        }
+        if (current?.collectionId === targetCollectionId && current.mode === mode) {
+          return current;
+        }
+        return { collectionId: targetCollectionId, mode };
+      });
+
+      const nextState: CustomItemDragState = {
+        ...nextActive,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        targetCollectionId,
+        mode,
+      };
+      setActiveCustomItemDrag(nextState);
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      const candidate = pointerItemDragCandidateRef.current;
+      const active = activeCustomItemDragRef.current;
+      if (!candidate && !active) {
+        return;
+      }
+
+      const trackedPointerId = active?.pointerId ?? candidate?.pointerId;
+      if (trackedPointerId !== undefined && event.pointerId !== trackedPointerId) {
+        return;
+      }
+
+      if (!active) {
+        pointerItemDragCandidateRef.current = null;
+        return;
+      }
+
+      event.preventDefault();
+      suppressNextItemClickRef.current = Date.now() + 250;
+
+      const reorderDropTarget = gridReorderDropStateRef.current;
+      const droppedInsideItemGrid =
+        selectedCollectionId !== null &&
+        active.sourceCollectionId === selectedCollectionId &&
+        isPointInsideItemGridArea(event.clientX, event.clientY);
+      const finalTargetCollectionId =
+        collectionDropTargetIdFromPoint(event.clientX, event.clientY) ?? active.targetCollectionId;
+      const finalMode: "move" | "duplicate" =
+        event.altKey ||
+        keyboardAltPressedRef.current ||
+        active.mode === "duplicate" ||
+        activeItemDragAltRef.current
+          ? "duplicate"
+          : "move";
+
+      console.log("[dnd][custom][drop]", {
+        itemIds: active.itemIds,
+        sourceCollectionId: active.sourceCollectionId,
+        targetCollectionId: finalTargetCollectionId,
+        altKey: finalMode === "duplicate",
+      });
+
+      clearPointerItemDrag();
+
+      if (
+        finalMode === "move" &&
+        reorderDropTarget &&
+        active.itemIds.length === 1 &&
+        selectedCollectionId !== null &&
+        active.sourceCollectionId === selectedCollectionId
+      ) {
+        void reorderSingleItemWithinSelectedCollection({
+          draggedItemId: active.itemIds[0],
+          targetItemId: reorderDropTarget.itemId,
+          position: reorderDropTarget.position,
+        });
+        return;
+      }
+
+      if (
+        finalMode === "duplicate" &&
+        selectedCollectionId !== null &&
+        active.sourceCollectionId === selectedCollectionId &&
+        (reorderDropTarget || droppedInsideItemGrid)
+      ) {
+        void duplicateItemsIntoSelectedCollectionAtDrop({
+          itemIds: active.itemIds,
+          reorderTarget: reorderDropTarget,
+        });
+        return;
+      }
+
+      if (!finalTargetCollectionId) {
+        return;
+      }
+      if (finalMode === "move" && active.sourceCollectionId === finalTargetCollectionId) {
+        console.log("[dnd][custom][drop] noop same-collection", {
+          sourceCollectionId: active.sourceCollectionId,
+          targetCollectionId: finalTargetCollectionId,
+          itemIds: active.itemIds,
+        });
+        return;
+      }
+
+      void handleCollectionMembershipDrop({
+        itemIds: active.itemIds,
+        sourceCollectionId: active.sourceCollectionId,
+        targetCollectionId: finalTargetCollectionId,
+        op: finalMode,
+      });
+    };
+
+    const handlePointerCancel = () => {
+      if (!pointerItemDragCandidateRef.current && !activeCustomItemDragRef.current) {
+        return;
+      }
+      clearPointerItemDrag();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, true);
+    window.addEventListener("pointerup", handlePointerUp, true);
+    window.addEventListener("pointercancel", handlePointerCancel, true);
+    window.addEventListener("blur", handlePointerCancel);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove, true);
+      window.removeEventListener("pointerup", handlePointerUp, true);
+      window.removeEventListener("pointercancel", handlePointerCancel, true);
+      window.removeEventListener("blur", handlePointerCancel);
+    };
+  }, [
+    clearPointerItemDrag,
+    duplicateItemsIntoSelectedCollectionAtDrop,
+    handleCollectionMembershipDrop,
+    reorderSingleItemWithinSelectedCollection,
+    searchQuery,
+    selectedCollectionId,
+    setActiveCustomItemDrag,
+    setGridReorderDropTarget,
+  ]);
+
+  const handleSidebarCollectionDragOver = useCallback(
+    (collectionId: string, event: React.DragEvent<HTMLElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const payload = parseSidebarItemDragPayload(event.dataTransfer) ?? activeItemDragPayloadRef.current;
+      const isAltCopy = event.altKey || keyboardAltPressedRef.current || activeItemDragAltRef.current;
+      const mode: "move" | "duplicate" = isAltCopy ? "duplicate" : "move";
+      event.dataTransfer.dropEffect = mode === "duplicate" ? "copy" : "move";
+      if (!payload) {
+        return;
+      }
+      setSidebarCollectionDropState((current) => {
+        if (
+          current?.collectionId === collectionId &&
+          current.mode === mode
+        ) {
+          return current;
+        }
+        return { collectionId, mode };
+      });
+    },
+    [],
+  );
+
+  const handleSidebarCollectionDragLeave = useCallback(
+    (collectionId: string, event: React.DragEvent<HTMLElement>) => {
+      const relatedTarget = event.relatedTarget;
+      if (relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget)) {
+        return;
+      }
+      setSidebarCollectionDropState((current) =>
+        current?.collectionId === collectionId ? null : current,
+      );
+    },
+    [],
+  );
+
+  const handleSidebarCollectionDrop = useCallback(
+    (collectionId: string, event: React.DragEvent<HTMLElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const payload = parseSidebarItemDragPayload(event.dataTransfer) ?? activeItemDragPayloadRef.current;
+      setIsItemDragActive(false);
+      setSidebarCollectionDropState(null);
+      activeItemDragPayloadRef.current = null;
+      if (!payload) {
+        console.warn("[dnd][collection][drop] missing-or-invalid-payload", {
+          targetCollectionId: collectionId,
+          types: Array.from(event.dataTransfer.types ?? []),
+        });
+        return;
+      }
+
+      const isAltCopy = event.altKey || keyboardAltPressedRef.current || activeItemDragAltRef.current;
+      const mode: "move" | "duplicate" = isAltCopy ? "duplicate" : "move";
+      if (mode === "move" && payload.sourceCollectionId === collectionId) {
+        console.log("[dnd][collection][drop] noop same-collection", {
+          targetCollectionId: collectionId,
+          sourceCollectionId: payload.sourceCollectionId,
+          itemIds: payload.itemIds,
+        });
+        return;
+      }
+
+      void handleCollectionMembershipDrop({
+        itemIds: payload.itemIds,
+        sourceCollectionId: payload.sourceCollectionId,
+        targetCollectionId: collectionId,
+        op: mode,
+      });
+    },
+    [handleCollectionMembershipDrop],
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Alt") {
+        keyboardAltPressedRef.current = true;
+      }
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Alt") {
+        keyboardAltPressedRef.current = false;
+      }
+    };
+    const handleWindowBlur = () => {
+      keyboardAltPressedRef.current = false;
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isItemDragActive) {
+      return;
+    }
+
+    const handleDocumentDragOver = (event: DragEvent) => {
+      const dataTransfer = event.dataTransfer;
+      if (!dataTransfer) {
+        return;
+      }
+      const payload =
+        parseSidebarItemDragPayload(dataTransfer) ?? activeItemDragPayloadRef.current;
+      if (!payload) {
+        return;
+      }
+      event.preventDefault();
+
+      const collectionId = collectionDropTargetIdFromPoint(event.clientX, event.clientY);
+      const isAltCopy = event.altKey || keyboardAltPressedRef.current || activeItemDragAltRef.current;
+      const mode: "move" | "duplicate" = isAltCopy ? "duplicate" : "move";
+      console.log("[dnd][document-fallback][dragover-any]", {
+        x: event.clientX,
+        y: event.clientY,
+        targetCollectionId: collectionId,
+        altKey: isAltCopy,
+        types: Array.from(dataTransfer.types ?? []),
+      });
+      if (!collectionId) {
+        setSidebarCollectionDropState(null);
+        dataTransfer.dropEffect = "move";
+        return;
+      }
+
+      dataTransfer.dropEffect = mode === "duplicate" ? "copy" : "move";
+      setSidebarCollectionDropState((current) =>
+        current?.collectionId === collectionId && current.mode === mode
+          ? current
+          : { collectionId, mode },
+      );
+      console.log("[dnd][document-fallback][dragover]", {
+        targetCollectionId: collectionId,
+        altKey: isAltCopy,
+      });
+    };
+
+    const handleDocumentDrop = (event: DragEvent) => {
+      const dataTransfer = event.dataTransfer;
+      if (!dataTransfer) {
+        return;
+      }
+      const payload =
+        parseSidebarItemDragPayload(dataTransfer) ?? activeItemDragPayloadRef.current;
+      if (!payload) {
+        return;
+      }
+      const collectionId = collectionDropTargetIdFromPoint(event.clientX, event.clientY);
+      console.log("[dnd][document-fallback][drop-any]", {
+        x: event.clientX,
+        y: event.clientY,
+        targetCollectionId: collectionId,
+        types: Array.from(dataTransfer.types ?? []),
+      });
+      if (!collectionId) {
+        setIsItemDragActive(false);
+        setSidebarCollectionDropState(null);
+        activeItemDragPayloadRef.current = null;
+        activeItemDragAltRef.current = false;
+        return;
+      }
+
+      const isAltCopy = event.altKey || keyboardAltPressedRef.current || activeItemDragAltRef.current;
+      const mode: "move" | "duplicate" = isAltCopy ? "duplicate" : "move";
+      event.preventDefault();
+      event.stopPropagation();
+      setIsItemDragActive(false);
+      setSidebarCollectionDropState(null);
+      activeItemDragPayloadRef.current = null;
+      activeItemDragAltRef.current = false;
+      console.log("[dnd][document-fallback][drop]", {
+        targetCollectionId: collectionId,
+        altKey: isAltCopy,
+        types: Array.from(dataTransfer.types ?? []),
+      });
+
+      void handleCollectionMembershipDrop({
+        itemIds: payload.itemIds,
+        sourceCollectionId: payload.sourceCollectionId,
+        targetCollectionId: collectionId,
+        op: mode,
+      });
+    };
+
+    document.addEventListener("dragover", handleDocumentDragOver, true);
+    document.addEventListener("drop", handleDocumentDrop, true);
+    return () => {
+      document.removeEventListener("dragover", handleDocumentDragOver, true);
+      document.removeEventListener("drop", handleDocumentDrop, true);
+    };
+  }, [isItemDragActive, handleCollectionMembershipDrop]);
 
   const handleDescriptionChange = (description: string) => {
     if (!selectedItem) return;
@@ -2677,8 +4423,33 @@ function App() {
     setDeleteConfirmItemIds([]);
     closeContextMenu();
     if (targetIds.length === 0) return;
+
+    if (selectedCollectionId !== null) {
+      const activeCollectionDeleteIds = itemsRef.current
+        .filter(
+          (item) => targetIds.includes(item.id) && item.collectionIds.includes(selectedCollectionId),
+        )
+        .map((item) => item.id);
+      if (activeCollectionDeleteIds.length > 0) {
+        void applyCollectionMembershipTransfer({
+          itemIds: activeCollectionDeleteIds,
+          sourceCollectionId: selectedCollectionId,
+          targetCollectionId: null,
+          mode: "move",
+        });
+        return;
+      }
+    }
+
     void performDeleteItems(targetIds);
-  }, [deleteConfirmItemIds, normalizeTargetItemIds, performDeleteItems, closeContextMenu]);
+  }, [
+    deleteConfirmItemIds,
+    normalizeTargetItemIds,
+    closeContextMenu,
+    selectedCollectionId,
+    applyCollectionMembershipTransfer,
+    performDeleteItems,
+  ]);
 
   const handleContextMenuAction = (action: ContextMenuAction, itemId: string) => {
     if (action === "retry-import") {
@@ -2728,16 +4499,64 @@ function App() {
     closeContextMenu();
   };
 
+  useEffect(() => {
+    const handleDuplicateShortcut = (event: KeyboardEvent) => {
+      if (event.repeat) return;
+      const key = event.key.toLowerCase();
+      const isDuplicateKey = key === "d" || event.code === "KeyD";
+      const hasDuplicateModifier = event.ctrlKey || event.metaKey;
+      if (!hasDuplicateModifier || event.altKey || event.shiftKey || !isDuplicateKey) {
+        return;
+      }
+      if (isEditableTarget(event.target)) return;
+      if (imageModalOpen || deleteConfirmItemIds.length > 0 || moveTargetItemIds.length > 0) {
+        return;
+      }
+
+      let targetIds: string[] = [];
+      if (contextMenu.open && contextMenu.itemId) {
+        targetIds = resolveActionTargetIds(contextMenu.itemId);
+      } else if (selectedIds.length > 0) {
+        targetIds = selectedIds;
+      }
+      if (targetIds.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      closeContextMenu();
+      void duplicateItemsById(targetIds);
+    };
+
+    window.addEventListener("keydown", handleDuplicateShortcut, true);
+    return () => window.removeEventListener("keydown", handleDuplicateShortcut, true);
+  }, [
+    contextMenu.open,
+    contextMenu.itemId,
+    deleteConfirmItemIds.length,
+    duplicateItemsById,
+    imageModalOpen,
+    moveTargetItemIds.length,
+    resolveActionTargetIds,
+    selectedIds,
+    closeContextMenu,
+  ]);
+
   const moveTargetCollectionIds = useMemo(() => {
     const ids = new Set(moveTargetItemIds);
     const collectionIds = new Set<string | null>();
     items.forEach((item) => {
       if (ids.has(item.id)) {
+        if (selectedCollectionId && item.collectionIds.includes(selectedCollectionId)) {
+          collectionIds.add(selectedCollectionId);
+          return;
+        }
         collectionIds.add(item.collectionId);
       }
     });
     return collectionIds;
-  }, [items, moveTargetItemIds]);
+  }, [items, moveTargetItemIds, selectedCollectionId]);
 
   const renderMoveCollectionButtons = (
     nodes: CollectionTreeNode[],
@@ -2783,10 +4602,16 @@ function App() {
         collections={collectionTree}
         tags={tags}
         selectedCollectionId={selectedCollectionId}
+        isItemDragActive={isItemDragActive}
         onSelectCollection={setSelectedCollectionId}
         onCreateCollection={createCollection}
         onRenameCollection={renameCollection}
         onDeleteCollection={requestDeleteCollection}
+        collectionDropTargetId={sidebarCollectionDropState?.collectionId ?? null}
+        collectionDropMode={sidebarCollectionDropState?.mode ?? null}
+        onCollectionDragOver={handleSidebarCollectionDragOver}
+        onCollectionDragLeave={handleSidebarCollectionDragLeave}
+        onCollectionDrop={handleSidebarCollectionDrop}
       />
       <div
         className="panel-resize-handle panel-resize-handle-left"
@@ -2824,7 +4649,11 @@ function App() {
           items={filteredItems}
           selectedIds={selectedIds}
           tileSize={tileSize}
+          reorderDropTargetItemId={gridReorderDropState?.itemId ?? null}
+          reorderDropPosition={gridReorderDropState?.position ?? null}
           onSelectItem={handleSelectItem}
+          onEmptyAreaClick={handleItemGridEmptyAreaClick}
+          onItemPointerDown={handleItemPointerDown}
           onItemDoubleClick={handleItemDoubleClick}
           onItemContextMenu={handleItemContextMenu}
           onImageThumbnailMissing={handleImageThumbnailMissing}
@@ -2851,6 +4680,29 @@ function App() {
           void duplicateItemsById(selectedIds);
         }}
       />
+
+      {customItemDragState && (
+        <div
+          className={`custom-item-drag-ghost ${
+            customItemDragState.mode === "duplicate" ? "duplicate" : "move"
+          }`}
+          style={
+            {
+              left: `${customItemDragState.clientX + 14}px`,
+              top: `${customItemDragState.clientY + 14}px`,
+            } as React.CSSProperties
+          }
+          aria-hidden="true"
+        >
+          <span className="custom-item-drag-ghost-label">
+            {customItemDragState.mode === "duplicate" ? "Copy to collection" : "Move to collection"}
+          </span>
+          <strong className="custom-item-drag-ghost-count">
+            {customItemDragState.itemIds.length} item
+            {customItemDragState.itemIds.length === 1 ? "" : "s"}
+          </strong>
+        </div>
+      )}
 
       <ContextMenu
         open={contextMenu.open}
@@ -3032,6 +4884,23 @@ function App() {
             <div className="image-modal-body">
               <img src={modalItem.previewUrl} alt={modalItem.title} />
             </div>
+          </div>
+        </div>
+      )}
+
+      {snackbar && (
+        <div className="snackbar-layer" role="status" aria-live="polite" aria-atomic="true">
+          <div className="snackbar">
+            <span className="snackbar-message">{snackbar.message}</span>
+            {snackbar.canUndo ? (
+              <button
+                type="button"
+                className="snackbar-action"
+                onClick={handleUndoSnackbar}
+              >
+                Undo
+              </button>
+            ) : null}
           </div>
         </div>
       )}

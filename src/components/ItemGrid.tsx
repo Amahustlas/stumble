@@ -7,7 +7,11 @@ type ItemGridProps = {
   items: Item[];
   selectedIds: string[];
   tileSize: number;
+  reorderDropTargetItemId?: string | null;
+  reorderDropPosition?: "before" | "after" | null;
   onSelectItem: (itemId: string, event: React.MouseEvent) => void;
+  onEmptyAreaClick: (event: React.MouseEvent<HTMLElement>) => void;
+  onItemPointerDown: (item: Item, event: React.PointerEvent<HTMLButtonElement>) => void;
   onItemDoubleClick: (item: Item) => void;
   onItemContextMenu: (item: Item, event: React.MouseEvent) => void;
   onImageThumbnailMissing: (item: Item) => void;
@@ -18,7 +22,11 @@ function ItemGrid({
   items,
   selectedIds,
   tileSize,
+  reorderDropTargetItemId = null,
+  reorderDropPosition = null,
   onSelectItem,
+  onEmptyAreaClick,
+  onItemPointerDown,
   onItemDoubleClick,
   onItemContextMenu,
   onImageThumbnailMissing,
@@ -39,9 +47,18 @@ function ItemGrid({
     return `thumbnail thumbnail-${type}`;
   };
 
+  const handleWrapClick: React.MouseEventHandler<HTMLElement> = (event) => {
+    const target = event.target;
+    if (target instanceof Element && target.closest("[data-item-id]")) {
+      return;
+    }
+    onEmptyAreaClick(event);
+  };
+
   return (
     <section
       className={`item-grid-wrap ${isDragOver ? "drag-over" : ""}`}
+      onClick={handleWrapClick}
       onDragOver={(event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -84,10 +101,22 @@ function ItemGrid({
               key={item.id}
               type="button"
               data-item-id={item.id}
-              className={`item-card ${selectedIds.includes(item.id) ? "selected" : ""}`}
+              draggable={false}
+              className={`item-card ${selectedIds.includes(item.id) ? "selected" : ""} ${
+                reorderDropTargetItemId === item.id && reorderDropPosition
+                  ? `reorder-target reorder-target-${reorderDropPosition}`
+                  : ""
+              }`}
               onClick={(event) => onSelectItem(item.id, event)}
               onDoubleClick={() => onItemDoubleClick(item)}
               onContextMenu={(event) => onItemContextMenu(item, event)}
+              onPointerDown={(event) => {
+                console.log("[dnd][tile][pointerdown]", { itemId: item.id, button: event.button });
+                onItemPointerDown(item, event);
+              }}
+              onDragStart={(event) => {
+                event.preventDefault();
+              }}
             >
               <div className={getThumbnailClass(item.type)}>
                 {item.type === "image" && imageSrc ? (
@@ -96,6 +125,7 @@ function ItemGrid({
                       className="thumbnail-image-element"
                       src={imageSrc}
                       alt={item.title}
+                      draggable={false}
                       loading="lazy"
                       onError={() => {
                         if (!item.hasThumb) return;
@@ -110,6 +140,7 @@ function ItemGrid({
                         className="bookmark-favicon-image"
                         src={item.faviconUrl}
                         alt=""
+                        draggable={false}
                         loading="lazy"
                       />
                     ) : (

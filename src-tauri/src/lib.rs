@@ -82,8 +82,21 @@ struct DbItemRow {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DbCollectionItemRow {
+    id: String,
+    collection_id: String,
+    item_id: String,
+    custom_title: Option<String>,
+    custom_description: Option<String>,
+    sort_index: i64,
+    created_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DbAppState {
     collections: Vec<DbCollectionRow>,
+    collection_items: Vec<DbCollectionItemRow>,
     items: Vec<DbItemRow>,
 }
 
@@ -173,6 +186,24 @@ struct DeleteItemsResult {
 #[serde(rename_all = "camelCase")]
 struct UpdateItemsCollectionResult {
     updated_rows: usize,
+    updated_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCollectionMembershipsResult {
+    created_rows: usize,
+    updated_rows: usize,
+    deleted_rows: usize,
+    skipped_rows: usize,
+    updated_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCollectionOrderResult {
+    updated_rows: usize,
+    skipped_rows: usize,
     updated_at: i64,
 }
 
@@ -297,6 +328,7 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
                 item_id TEXT NOT NULL,
                 custom_title TEXT NULL,
                 custom_description TEXT NULL,
+                sort_index INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
                 FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
@@ -333,6 +365,10 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
     ensure_items_status_columns(connection)?;
     ensure_items_bookmark_columns(connection)?;
     ensure_collections_columns(connection)?;
+    ensure_collection_items_columns(connection)?;
+    ensure_collection_items_indexes(connection)?;
+    backfill_collection_items_from_items(connection)?;
+    sync_legacy_item_collection_ids(connection)?;
     Ok(())
 }
 
@@ -527,6 +563,159 @@ fn ensure_collections_columns(connection: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|err| format!("failed to backfill collections.updated_at values: {}", err))?;
+
+    Ok(())
+}
+
+fn ensure_collection_items_columns(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare("PRAGMA table_info(collection_items)")
+        .map_err(|err| format!("failed to inspect collection_items table info: {}", err))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to read collection_items table info: {}", err))?;
+
+    let mut has_sort_index = false;
+    for row_result in rows {
+        let column_name = row_result
+            .map_err(|err| format!("failed to parse collection_items table column: {}", err))?;
+        if column_name == "sort_index" {
+            has_sort_index = true;
+        }
+    }
+
+    if !has_sort_index {
+        connection
+            .execute(
+                "ALTER TABLE collection_items ADD COLUMN sort_index INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|err| format!("failed to add collection_items.sort_index column: {}", err))?;
+    }
+
+    if !has_sort_index {
+        connection
+            .execute(
+                "UPDATE collection_items
+                 SET sort_index = CASE
+                    WHEN created_at IS NULL THEN 0
+                    ELSE created_at
+                 END",
+                [],
+            )
+            .map_err(|err| {
+                format!("failed to backfill collection_items.sort_index values: {}", err)
+            })?;
+    }
+
+    Ok(())
+}
+
+fn ensure_collection_items_indexes(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_items_collection_item_unique
+            ON collection_items(collection_id, item_id);
+            CREATE INDEX IF NOT EXISTS idx_collection_items_item_id
+            ON collection_items(item_id);
+            CREATE INDEX IF NOT EXISTS idx_collection_items_collection_id
+            ON collection_items(collection_id);
+            CREATE INDEX IF NOT EXISTS idx_collection_items_collection_sort
+            ON collection_items(collection_id, sort_index);
+            "#,
+        )
+        .map_err(|err| format!("failed to ensure collection_items indexes: {}", err))?;
+    Ok(())
+}
+
+fn backfill_collection_items_from_items(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare(
+            "SELECT id, collection_id, created_at
+             FROM items
+             WHERE collection_id IS NOT NULL AND TRIM(collection_id) <> ''",
+        )
+        .map_err(|err| format!("failed to prepare collection_items backfill query: {}", err))?;
+
+    let row_iter = stmt
+        .query_map([], |row| {
+            let item_id: String = row.get(0)?;
+            let collection_id: String = row.get(1)?;
+            let created_at: i64 = row.get(2)?;
+            Ok((item_id, collection_id, created_at))
+        })
+        .map_err(|err| format!("failed to query items for collection_items backfill: {}", err))?;
+
+    let mut rows = Vec::new();
+    for row_result in row_iter {
+        rows.push(
+            row_result
+                .map_err(|err| format!("failed to read collection_items backfill row: {}", err))?,
+        );
+    }
+
+    for (item_id, collection_id, created_at) in rows {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO collection_items (
+                    id,
+                    collection_id,
+                    item_id,
+                    custom_title,
+                    custom_description,
+                    sort_index,
+                    created_at
+                ) VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    collection_id,
+                    item_id,
+                    created_at.max(0),
+                    created_at.max(0)
+                ],
+            )
+            .map_err(|err| format!("failed to backfill collection_items row: {}", err))?;
+    }
+
+    Ok(())
+}
+
+fn sync_legacy_item_collection_ids(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE items
+             SET collection_id = NULL
+             WHERE collection_id IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM collection_items AS ci
+                 WHERE ci.item_id = items.id
+                   AND ci.collection_id = items.collection_id
+               )",
+            [],
+        )
+        .map_err(|err| format!("failed to clear stale legacy item.collection_id values: {}", err))?;
+
+    connection
+        .execute(
+            "UPDATE items
+             SET collection_id = (
+               SELECT ci.collection_id
+               FROM collection_items AS ci
+               WHERE ci.item_id = items.id
+               ORDER BY ci.created_at ASC, ci.id ASC
+               LIMIT 1
+             )
+             WHERE collection_id IS NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM collection_items AS ci
+                 WHERE ci.item_id = items.id
+               )",
+            [],
+        )
+        .map_err(|err| format!("failed to backfill legacy item.collection_id values: {}", err))?;
 
     Ok(())
 }
@@ -1831,6 +2020,42 @@ fn load_app_state() -> Result<DbAppState, String> {
             .push(row_result.map_err(|err| format!("failed to read collection row: {}", err))?);
     }
 
+    let mut collection_items_stmt = connection
+        .prepare(
+            "SELECT
+                id,
+                collection_id,
+                item_id,
+                custom_title,
+                custom_description,
+                sort_index,
+                created_at
+             FROM collection_items
+             ORDER BY collection_id ASC, sort_index ASC, created_at ASC, id ASC",
+        )
+        .map_err(|err| format!("failed to prepare collection_items query: {}", err))?;
+
+    let collection_items_iter = collection_items_stmt
+        .query_map([], |row| {
+            Ok(DbCollectionItemRow {
+                id: row.get(0)?,
+                collection_id: row.get(1)?,
+                item_id: row.get(2)?,
+                custom_title: row.get(3)?,
+                custom_description: row.get(4)?,
+                sort_index: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .map_err(|err| format!("failed to query collection_items: {}", err))?;
+
+    let mut collection_items = Vec::new();
+    for row_result in collection_items_iter {
+        collection_items.push(
+            row_result.map_err(|err| format!("failed to read collection_items row: {}", err))?,
+        );
+    }
+
     let mut items_stmt = connection
         .prepare(
             "SELECT
@@ -1899,7 +2124,11 @@ fn load_app_state() -> Result<DbAppState, String> {
         items.push(row_result.map_err(|err| format!("failed to read item row: {}", err))?);
     }
 
-    Ok(DbAppState { collections, items })
+    Ok(DbAppState {
+        collections,
+        collection_items,
+        items,
+    })
 }
 
 #[tauri::command]
@@ -2130,22 +2359,48 @@ fn delete_collection(id: String) -> Result<usize, String> {
         }
 
         let subtree_ids = collect_collection_subtree_ids_in_tx(&transaction, &trimmed_id)?;
-        let mut item_ids = Vec::new();
+        let subtree_id_set: BTreeSet<String> = subtree_ids.iter().cloned().collect();
+        let mut candidate_item_ids = Vec::new();
         let mut seen_item_ids = BTreeSet::new();
         for collection_id in &subtree_ids {
             let mut stmt = transaction
-                .prepare("SELECT id FROM items WHERE collection_id = ?1")
-                .map_err(|err| format!("failed to prepare collection item query: {}", err))?;
+                .prepare("SELECT DISTINCT item_id FROM collection_items WHERE collection_id = ?1")
+                .map_err(|err| format!("failed to prepare collection membership query: {}", err))?;
             let row_iter = stmt
                 .query_map(params![collection_id], |row| row.get::<_, String>(0))
-                .map_err(|err| format!("failed to query collection item ids: {}", err))?;
+                .map_err(|err| format!("failed to query collection membership item ids: {}", err))?;
 
             for row_result in row_iter {
                 let item_id = row_result
                     .map_err(|err| format!("failed to read collection item id: {}", err))?;
                 if seen_item_ids.insert(item_id.clone()) {
-                    item_ids.push(item_id);
+                    candidate_item_ids.push(item_id);
                 }
+            }
+        }
+
+        let mut item_ids = Vec::new();
+        for item_id in candidate_item_ids {
+            let mut membership_stmt = transaction
+                .prepare("SELECT collection_id FROM collection_items WHERE item_id = ?1")
+                .map_err(|err| format!("failed to prepare item membership scan: {}", err))?;
+            let membership_iter = membership_stmt
+                .query_map(params![&item_id], |row| row.get::<_, String>(0))
+                .map_err(|err| format!("failed to query item memberships for delete preflight: {}", err))?;
+
+            let mut has_membership_outside_subtree = false;
+            for membership_row in membership_iter {
+                let membership_collection_id = membership_row.map_err(|err| {
+                    format!("failed to read item membership row during delete preflight: {}", err)
+                })?;
+                if !subtree_id_set.contains(&membership_collection_id) {
+                    has_membership_outside_subtree = true;
+                    break;
+                }
+            }
+
+            if !has_membership_outside_subtree {
+                item_ids.push(item_id);
             }
         }
 
@@ -2202,6 +2457,7 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
         updated_at,
         tags,
     } = item;
+    let collection_id_for_membership = collection_id.clone();
 
     transaction
         .execute(
@@ -2250,6 +2506,11 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
             ],
         )
         .map_err(|err| format!("failed to insert item row: {}", err))?;
+
+    if let Some(collection_id) = collection_id_for_membership.as_deref() {
+        let sort_index = next_collection_item_sort_index_in_tx(transaction, collection_id)?;
+        insert_collection_membership_in_tx(transaction, &id, collection_id, sort_index, created_at)?;
+    }
 
     increment_vault_ref_in_tx(transaction, &vault_key, &vault_path)?;
 
@@ -2524,15 +2785,236 @@ fn delete_items(item_ids: Vec<String>) -> Result<usize, String> {
     Ok(result.deleted_rows)
 }
 
+fn normalize_trimmed_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn normalize_optional_trimmed_id(value: Option<String>) -> Option<String> {
+    value.and_then(|entry| normalize_trimmed_id(&entry))
+}
+
+fn normalize_item_ids_input(item_ids: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for item_id in item_ids {
+        if let Some(trimmed) = normalize_trimmed_id(&item_id) {
+            if seen.insert(trimmed.clone()) {
+                normalized.push(trimmed);
+            }
+        }
+    }
+    normalized
+}
+
+fn validate_collection_exists_in_tx(
+    transaction: &Transaction<'_>,
+    collection_id: &str,
+) -> Result<(), String> {
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM collections WHERE id = ?1",
+            params![collection_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|err| format!("failed to verify collection existence: {}", err))?;
+    if exists.is_none() {
+        return Err(format!("collection not found: {}", collection_id));
+    }
+    Ok(())
+}
+
+fn collection_membership_exists_in_tx(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    collection_id: &str,
+) -> Result<bool, String> {
+    let exists = transaction
+        .query_row(
+            "SELECT 1
+             FROM collection_items
+             WHERE item_id = ?1 AND collection_id = ?2
+             LIMIT 1",
+            params![item_id, collection_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|err| format!("failed to verify collection membership: {}", err))?;
+    Ok(exists.is_some())
+}
+
+fn next_collection_item_sort_index_in_tx(
+    transaction: &Transaction<'_>,
+    collection_id: &str,
+) -> Result<i64, String> {
+    transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sort_index), -1) + 1
+             FROM collection_items
+             WHERE collection_id = ?1",
+            params![collection_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|err| format!("failed to resolve next collection item sort index: {}", err))
+}
+
+fn insert_collection_membership_in_tx(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    collection_id: &str,
+    sort_index: i64,
+    created_at: i64,
+) -> Result<usize, String> {
+    let membership_id = Uuid::new_v4().to_string();
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO collection_items (
+                id,
+                collection_id,
+                item_id,
+                custom_title,
+                custom_description,
+                sort_index,
+                created_at
+             ) VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5)",
+            params![membership_id, collection_id, item_id, sort_index, created_at],
+        )
+        .map_err(|err| format!("failed to insert collection membership: {}", err))
+}
+
+fn sync_item_primary_collection_in_tx(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    preferred_collection_id: Option<&str>,
+    updated_at: i64,
+) -> Result<(), String> {
+    let current_collection_id = transaction
+        .query_row(
+            "SELECT collection_id FROM items WHERE id = ?1",
+            params![item_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|err| format!("failed to read item while syncing primary collection: {}", err))?
+        .ok_or_else(|| format!("item not found while syncing primary collection: {}", item_id))?;
+
+    let preferred_valid = match preferred_collection_id {
+        Some(preferred) => collection_membership_exists_in_tx(transaction, item_id, preferred)?,
+        None => false,
+    };
+    let current_valid = match current_collection_id.as_deref() {
+        Some(current_id) => collection_membership_exists_in_tx(transaction, item_id, current_id)?,
+        None => false,
+    };
+
+    let next_collection_id = if preferred_valid {
+        preferred_collection_id.map(str::to_string)
+    } else if current_valid {
+        current_collection_id
+    } else {
+        transaction
+            .query_row(
+                "SELECT collection_id
+                 FROM collection_items
+                 WHERE item_id = ?1
+                 ORDER BY sort_index ASC, created_at ASC, id ASC
+                 LIMIT 1",
+                params![item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to resolve fallback primary collection: {}", err))?
+    };
+
+    transaction
+        .execute(
+            "UPDATE items
+             SET collection_id = ?1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![next_collection_id.as_deref(), updated_at, item_id],
+        )
+        .map_err(|err| format!("failed to sync item primary collection: {}", err))?;
+
+    Ok(())
+}
+
+fn resolve_source_membership_for_move_in_tx(
+    transaction: &Transaction<'_>,
+    item_id: &str,
+    source_collection_id: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    if let Some(source_collection_id) = source_collection_id {
+        return transaction
+            .query_row(
+                "SELECT id, collection_id
+                 FROM collection_items
+                 WHERE item_id = ?1 AND collection_id = ?2
+                 LIMIT 1",
+                params![item_id, source_collection_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|err| format!("failed to resolve explicit source membership: {}", err));
+    }
+
+    transaction
+        .query_row(
+            "SELECT ci.id, ci.collection_id
+             FROM collection_items AS ci
+             LEFT JOIN items AS i ON i.id = ci.item_id
+             WHERE ci.item_id = ?1
+             ORDER BY
+               CASE
+                 WHEN i.collection_id IS NOT NULL AND ci.collection_id = i.collection_id THEN 0
+                 ELSE 1
+               END,
+               ci.sort_index ASC,
+               ci.created_at ASC,
+               ci.id ASC
+             LIMIT 1",
+            params![item_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|err| format!("failed to resolve fallback source membership: {}", err))
+}
+
 #[tauri::command]
-fn update_items_collection(
+fn move_collection_item_memberships(
     item_ids: Vec<String>,
-    collection_id: Option<String>,
-) -> Result<UpdateItemsCollectionResult, String> {
-    if item_ids.is_empty() {
-        return Ok(UpdateItemsCollectionResult {
+    source_collection_id: Option<String>,
+    target_collection_id: Option<String>,
+) -> Result<UpdateCollectionMembershipsResult, String> {
+    let normalized_item_ids = normalize_item_ids_input(item_ids);
+    let normalized_source_collection_id = normalize_optional_trimmed_id(source_collection_id);
+    let normalized_target_collection_id = normalize_optional_trimmed_id(target_collection_id);
+
+    let updated_at = Utc::now().timestamp_millis();
+    if normalized_item_ids.is_empty() {
+        return Ok(UpdateCollectionMembershipsResult {
+            created_rows: 0,
             updated_rows: 0,
-            updated_at: Utc::now().timestamp_millis(),
+            deleted_rows: 0,
+            skipped_rows: 0,
+            updated_at,
+        });
+    }
+
+    if normalized_source_collection_id == normalized_target_collection_id
+        && normalized_source_collection_id.is_some()
+    {
+        return Ok(UpdateCollectionMembershipsResult {
+            created_rows: 0,
+            updated_rows: 0,
+            deleted_rows: 0,
+            skipped_rows: normalized_item_ids.len(),
+            updated_at,
         });
     }
 
@@ -2541,28 +3023,255 @@ fn update_items_collection(
     let transaction = connection
         .transaction()
         .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
-    let updated_at = Utc::now().timestamp_millis();
 
+    if let Some(target_id) = normalized_target_collection_id.as_deref() {
+        validate_collection_exists_in_tx(&transaction, target_id)?;
+    }
+    if let Some(source_id) = normalized_source_collection_id.as_deref() {
+        validate_collection_exists_in_tx(&transaction, source_id)?;
+    }
+
+    let mut created_rows = 0usize;
     let mut updated_rows = 0usize;
-    for item_id in item_ids {
-        let affected = transaction
-            .execute(
-                "UPDATE items
-                 SET collection_id = ?1, updated_at = ?2
-                 WHERE id = ?3",
-                params![collection_id.as_deref(), updated_at, item_id],
-            )
-            .map_err(|err| format!("failed to update item collection: {}", err))?;
-        updated_rows += affected;
+    let mut deleted_rows = 0usize;
+    let mut skipped_rows = 0usize;
+
+    for item_id in &normalized_item_ids {
+        let source_membership = resolve_source_membership_for_move_in_tx(
+            &transaction,
+            item_id,
+            normalized_source_collection_id.as_deref(),
+        )?;
+
+        match (source_membership, normalized_target_collection_id.as_deref()) {
+            (None, None) => {
+                skipped_rows += 1;
+            }
+            (None, Some(target_id)) => {
+                let next_sort_index = next_collection_item_sort_index_in_tx(&transaction, target_id)?;
+                let inserted = insert_collection_membership_in_tx(
+                    &transaction,
+                    item_id,
+                    target_id,
+                    next_sort_index,
+                    updated_at,
+                )?;
+                if inserted == 0 {
+                    skipped_rows += 1;
+                } else {
+                    created_rows += inserted;
+                }
+                sync_item_primary_collection_in_tx(&transaction, item_id, Some(target_id), updated_at)?;
+            }
+            (Some((_membership_id, current_collection_id)), Some(target_id)) => {
+                if current_collection_id == target_id {
+                    skipped_rows += 1;
+                    sync_item_primary_collection_in_tx(
+                        &transaction,
+                        item_id,
+                        Some(target_id),
+                        updated_at,
+                    )?;
+                    continue;
+                }
+
+                let target_exists =
+                    collection_membership_exists_in_tx(&transaction, item_id, target_id)?;
+                if target_exists {
+                    let affected = transaction
+                        .execute(
+                            "DELETE FROM collection_items
+                             WHERE item_id = ?1 AND collection_id = ?2",
+                            params![item_id, current_collection_id],
+                        )
+                        .map_err(|err| {
+                            format!("failed to collapse duplicate membership during move: {}", err)
+                        })?;
+                    if affected == 0 {
+                        skipped_rows += 1;
+                    } else {
+                        deleted_rows += affected;
+                    }
+                } else {
+                    let next_sort_index =
+                        next_collection_item_sort_index_in_tx(&transaction, target_id)?;
+                    let affected = transaction
+                        .execute(
+                            "UPDATE collection_items
+                             SET collection_id = ?1,
+                                 sort_index = ?2
+                             WHERE item_id = ?3 AND collection_id = ?4",
+                            params![target_id, next_sort_index, item_id, current_collection_id],
+                        )
+                        .map_err(|err| format!("failed to move collection membership: {}", err))?;
+                    if affected == 0 {
+                        skipped_rows += 1;
+                    } else {
+                        updated_rows += affected;
+                    }
+                }
+
+                sync_item_primary_collection_in_tx(&transaction, item_id, Some(target_id), updated_at)?;
+            }
+            (Some((_membership_id, current_collection_id)), None) => {
+                let affected = transaction
+                    .execute(
+                        "DELETE FROM collection_items
+                         WHERE item_id = ?1 AND collection_id = ?2",
+                        params![item_id, current_collection_id],
+                    )
+                    .map_err(|err| format!("failed to remove collection membership: {}", err))?;
+                if affected == 0 {
+                    skipped_rows += 1;
+                } else {
+                    deleted_rows += affected;
+                }
+                sync_item_primary_collection_in_tx(&transaction, item_id, None, updated_at)?;
+            }
+        }
     }
 
     transaction
         .commit()
         .map_err(|err| format!("failed to commit sqlite transaction: {}", err))?;
 
-    Ok(UpdateItemsCollectionResult {
+    Ok(UpdateCollectionMembershipsResult {
+        created_rows,
         updated_rows,
+        deleted_rows,
+        skipped_rows,
         updated_at,
+    })
+}
+
+#[tauri::command]
+fn add_items_to_collection(
+    item_ids: Vec<String>,
+    collection_id: String,
+) -> Result<UpdateCollectionMembershipsResult, String> {
+    let normalized_item_ids = normalize_item_ids_input(item_ids);
+    let normalized_collection_id = normalize_trimmed_id(&collection_id)
+        .ok_or_else(|| "collection id cannot be empty".to_string())?;
+    let updated_at = Utc::now().timestamp_millis();
+
+    if normalized_item_ids.is_empty() {
+        return Ok(UpdateCollectionMembershipsResult {
+            created_rows: 0,
+            updated_rows: 0,
+            deleted_rows: 0,
+            skipped_rows: 0,
+            updated_at,
+        });
+    }
+
+    initialize_db()?;
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+
+    validate_collection_exists_in_tx(&transaction, &normalized_collection_id)?;
+
+    let mut created_rows = 0usize;
+    let mut skipped_rows = 0usize;
+
+    for item_id in &normalized_item_ids {
+        let next_sort_index =
+            next_collection_item_sort_index_in_tx(&transaction, &normalized_collection_id)?;
+        let inserted = insert_collection_membership_in_tx(
+            &transaction,
+            item_id,
+            &normalized_collection_id,
+            next_sort_index,
+            updated_at,
+        )?;
+        if inserted == 0 {
+            skipped_rows += 1;
+        } else {
+            created_rows += inserted;
+        }
+        sync_item_primary_collection_in_tx(&transaction, item_id, None, updated_at)?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit sqlite transaction: {}", err))?;
+
+    Ok(UpdateCollectionMembershipsResult {
+        created_rows,
+        updated_rows: 0,
+        deleted_rows: 0,
+        skipped_rows,
+        updated_at,
+    })
+}
+
+#[tauri::command]
+fn reorder_collection_items(
+    collection_id: String,
+    ordered_item_ids: Vec<String>,
+) -> Result<UpdateCollectionOrderResult, String> {
+    let normalized_collection_id = normalize_trimmed_id(&collection_id)
+        .ok_or_else(|| "collection id cannot be empty".to_string())?;
+    let normalized_item_ids = normalize_item_ids_input(ordered_item_ids);
+    let updated_at = Utc::now().timestamp_millis();
+
+    if normalized_item_ids.is_empty() {
+        return Ok(UpdateCollectionOrderResult {
+            updated_rows: 0,
+            skipped_rows: 0,
+            updated_at,
+        });
+    }
+
+    initialize_db()?;
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+
+    validate_collection_exists_in_tx(&transaction, &normalized_collection_id)?;
+
+    let mut updated_rows = 0usize;
+    let mut skipped_rows = 0usize;
+    for (index, item_id) in normalized_item_ids.iter().enumerate() {
+        let affected = transaction
+            .execute(
+                "UPDATE collection_items
+                 SET sort_index = ?1
+                 WHERE collection_id = ?2 AND item_id = ?3",
+                params![index as i64, normalized_collection_id, item_id],
+            )
+            .map_err(|err| format!("failed to reorder collection_items row: {}", err))?;
+        if affected == 0 {
+            skipped_rows += 1;
+        } else {
+            updated_rows += affected;
+        }
+    }
+
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit sqlite transaction: {}", err))?;
+
+    Ok(UpdateCollectionOrderResult {
+        updated_rows,
+        skipped_rows,
+        updated_at,
+    })
+}
+
+#[tauri::command]
+fn update_items_collection(
+    item_ids: Vec<String>,
+    collection_id: Option<String>,
+) -> Result<UpdateItemsCollectionResult, String> {
+    let membership_result = move_collection_item_memberships(item_ids, None, collection_id)?;
+    Ok(UpdateItemsCollectionResult {
+        updated_rows: membership_result.created_rows
+            + membership_result.updated_rows
+            + membership_result.deleted_rows,
+        updated_at: membership_result.updated_at,
     })
 }
 
@@ -3018,6 +3727,9 @@ pub fn run() {
             insert_items_batch,
             delete_items,
             delete_items_with_cleanup,
+            move_collection_item_memberships,
+            add_items_to_collection,
+            reorder_collection_items,
             update_items_collection,
             update_item_description,
             update_item_bookmark_metadata,

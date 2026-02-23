@@ -7,7 +7,7 @@ import ContextMenu, { type ContextMenuAction } from "./components/ContextMenu";
 import ItemGrid from "./components/ItemGrid";
 import PreviewPanel from "./components/PreviewPanel";
 import Sidebar from "./components/Sidebar";
-import Topbar from "./components/Topbar";
+import Topbar, { type TopbarSortOption } from "./components/Topbar";
 import {
   initDb,
   loadDbAppState,
@@ -33,6 +33,7 @@ import {
   addItemsToCollection as addItemsToCollectionInDb,
   reorderCollectionItems as reorderCollectionItemsInDb,
   updateItemDescription as updateItemDescriptionInDb,
+  updateItemPreferences as updateItemPreferencesInDb,
   updateItemTags as updateItemTagsInDb,
   updateItemBookmarkMetadata as updateItemBookmarkMetadataInDb,
   updateItemMediaState as updateItemMediaStateInDb,
@@ -75,6 +76,7 @@ export type ThumbStatus = "ready" | "pending" | "skipped" | "error";
 export type ImportStatus = "ready" | "processing" | "error";
 export type BookmarkMetaStatus = "ready" | "pending" | "error";
 export type ItemStatus = "saved" | "archived" | "processing" | "error";
+type LibraryViewMode = "all" | "favorites";
 
 export type ItemCollectionMembershipInstance = {
   instanceId: string;
@@ -92,6 +94,7 @@ export type Item = {
   title: string;
   description: string;
   rating: number;
+  isFavorite: boolean;
   status: ItemStatus;
   importStatus: ImportStatus;
   tagIds: string[];
@@ -764,6 +767,51 @@ function formatDateFromTimestampMs(timestampMs: number): string {
   return parsed.toISOString().slice(0, 10);
 }
 
+function normalizeItemRating(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(5, Math.round(value)));
+}
+
+function dateSortValue(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareItemsBySortOption(left: Item, right: Item, sortOption: TopbarSortOption): number {
+  if (sortOption === "name-asc") {
+    const nameCompare = left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
+    if (nameCompare !== 0) {
+      return nameCompare;
+    }
+    return right.id.localeCompare(left.id);
+  }
+
+  if (sortOption === "rating-desc") {
+    const leftRating = normalizeItemRating(left.rating);
+    const rightRating = normalizeItemRating(right.rating);
+    if (leftRating !== rightRating) {
+      return rightRating - leftRating;
+    }
+    const createdDelta = dateSortValue(right.createdAt) - dateSortValue(left.createdAt);
+    if (createdDelta !== 0) {
+      return createdDelta;
+    }
+    return left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
+  }
+
+  const leftCreatedAt = dateSortValue(left.createdAt);
+  const rightCreatedAt = dateSortValue(right.createdAt);
+  if (leftCreatedAt !== rightCreatedAt) {
+    return sortOption === "oldest"
+      ? leftCreatedAt - rightCreatedAt
+      : rightCreatedAt - leftCreatedAt;
+  }
+
+  return left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
+}
+
 function shouldSkipThumbnailGeneration(args: {
   width?: number;
   height?: number;
@@ -917,6 +965,7 @@ function createImportPlaceholderItem(args: {
     title: fileTitleFromFilename(filename),
     description: "Importing...",
     rating: 0,
+    isFavorite: false,
     status: "processing",
     importStatus: "processing",
     tagIds: [],
@@ -962,6 +1011,7 @@ function createBookmarkPlaceholderItem(args: {
     title: "Loading...",
     description: "Fetching bookmark metadata...",
     rating: 0,
+    isFavorite: false,
     status: "processing",
     importStatus: "ready",
     tagIds: [],
@@ -1091,6 +1141,8 @@ function toDbInsertItem(args: {
     faviconPath: item.faviconPath ?? null,
     metaStatus: item.metaStatus,
     description: item.description,
+    rating: normalizeItemRating(item.rating),
+    isFavorite: Boolean(item.isFavorite),
     createdAt: createdAtMs,
     updatedAt: updatedAtMs,
     tags: item.tags,
@@ -1177,7 +1229,8 @@ function mapDbItemToItem(args: {
         ? item.title || hostname || sourceUrl || "Untitled bookmark"
         : item.title || fileTitleFromFilename(item.filename),
     description: item.description ?? "",
-    rating: 0,
+    rating: normalizeItemRating(item.rating),
+    isFavorite: Boolean(item.isFavorite),
     status: deriveItemStatus({ itemType, importStatus, metaStatus }),
     importStatus,
     tagIds: item.tagIds ?? [],
@@ -1215,6 +1268,8 @@ function App() {
   const [tags, setTags] = useState<Tag[]>([]);
   const [items, setItems] = useState<Item[]>(initialItems);
   const [searchQuery, setSearchQuery] = useState("");
+  const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>("all");
+  const [sortOption, setSortOption] = useState<TopbarSortOption>("newest");
   const [tileSize, setTileSize] = useState(220);
   const [nativeDropEnabled, setNativeDropEnabled] = useState(false);
   const [imageModalOpen, setImageModalOpen] = useState(false);
@@ -1324,6 +1379,24 @@ function App() {
       ? collectionPathById.get(selectedCollectionId) ?? "All Items"
       : "All Items";
   const activeTagFilter = selectedTagId ? tagById.get(selectedTagId) ?? null : null;
+
+  const handleSidebarSelectCollection = useCallback((collectionId: string | null) => {
+    if (collectionId !== null) {
+      setLibraryViewMode("all");
+    }
+    setSelectedCollectionId(collectionId);
+  }, []);
+
+  const handleSidebarSelectTag = useCallback((tagId: string | null) => {
+    if (tagId !== null) {
+      setLibraryViewMode("all");
+    }
+    setSelectedTagId(tagId);
+  }, []);
+
+  const handleSidebarSelectMenuView = useCallback((menuLabel: string) => {
+    setLibraryViewMode(menuLabel === "Favorites" ? "favorites" : "all");
+  }, []);
 
   const reloadItemsFromDb = useCallback(
     async (collectionsOverride?: Collection[]) => {
@@ -2734,6 +2807,98 @@ function App() {
     [tagById],
   );
 
+  const updateItemPreferences = useCallback(
+    async (
+      itemId: string,
+      changes: {
+        rating?: number;
+        isFavorite?: boolean;
+      },
+    ) => {
+      const currentItem = itemsRef.current.find((item) => item.id === itemId);
+      if (!currentItem) {
+        return;
+      }
+
+      const nextRating =
+        changes.rating === undefined ? currentItem.rating : normalizeItemRating(changes.rating);
+      const nextIsFavorite =
+        changes.isFavorite === undefined ? currentItem.isFavorite : Boolean(changes.isFavorite);
+      if (nextRating === currentItem.rating && nextIsFavorite === currentItem.isFavorite) {
+        return;
+      }
+
+      const previousSnapshot = {
+        rating: currentItem.rating,
+        isFavorite: currentItem.isFavorite,
+        updatedAt: currentItem.updatedAt,
+      };
+
+      setItems((currentItems) =>
+        currentItems.map((item) =>
+          item.id === itemId
+            ? {
+                ...item,
+                rating: nextRating,
+                isFavorite: nextIsFavorite,
+              }
+            : item,
+        ),
+      );
+
+      try {
+        const updatedAt = await updateItemPreferencesInDb({
+          itemId,
+          ...(changes.rating !== undefined ? { rating: nextRating } : {}),
+          ...(changes.isFavorite !== undefined ? { isFavorite: nextIsFavorite } : {}),
+        });
+        setItems((currentItems) =>
+          currentItems.map((item) =>
+            item.id === itemId
+              ? { ...item, updatedAt: formatDateFromTimestampMs(updatedAt) }
+              : item,
+          ),
+        );
+      } catch (error) {
+        console.error("Failed to update item preferences:", error);
+        setItems((currentItems) =>
+          currentItems.map((item) =>
+            item.id === itemId
+              ? {
+                  ...item,
+                  rating: previousSnapshot.rating,
+                  isFavorite: previousSnapshot.isFavorite,
+                  updatedAt: previousSnapshot.updatedAt,
+                }
+              : item,
+          ),
+        );
+      }
+    },
+    [],
+  );
+
+  const handleSetItemRating = useCallback(
+    (itemId: string, rating: number) => updateItemPreferences(itemId, { rating }),
+    [updateItemPreferences],
+  );
+
+  const handleToggleItemFavorite = useCallback(
+    (itemId: string) => {
+      const currentItem = itemsRef.current.find((item) => item.id === itemId);
+      if (!currentItem) {
+        return;
+      }
+      return updateItemPreferences(itemId, { isFavorite: !currentItem.isFavorite });
+    },
+    [updateItemPreferences],
+  );
+
+  // QA checklist (ratings/favorites MVP):
+  // - Set rating 1..5, click same star again to clear to 0, restart app and verify persistence.
+  // - Toggle favorite in Preview, restart app and verify Favorites sidebar view includes/excludes item.
+  // - Combine search/tag/collection with each sort option, including Rating high->low.
+
   const addTagToItem = useCallback(
     async (itemId: string, tagId: string) => {
       const targetItem = itemsRef.current.find((item) => item.id === itemId);
@@ -3890,15 +4055,18 @@ function App() {
     return () => window.removeEventListener("paste", handlePaste);
   }, [queueImportSources, queueBookmarkUrls]);
 
-  const scopedItems = useMemo(() => {
-    if (!selectedCollectionId) return items;
+  const collectionScopedItems = useMemo(() => {
+    if (!selectedCollectionId) {
+      return items;
+    }
     return items
       .filter((item) => item.collectionIds.includes(selectedCollectionId))
       .slice()
       .sort((left, right) => {
         const leftMembership = left.collectionInstancesByCollectionId[selectedCollectionId];
         const rightMembership = right.collectionInstancesByCollectionId[selectedCollectionId];
-        const leftSortKey = leftMembership?.sortIndex ?? leftMembership?.createdAt ?? Number.MAX_SAFE_INTEGER;
+        const leftSortKey =
+          leftMembership?.sortIndex ?? leftMembership?.createdAt ?? Number.MAX_SAFE_INTEGER;
         const rightSortKey =
           rightMembership?.sortIndex ?? rightMembership?.createdAt ?? Number.MAX_SAFE_INTEGER;
         if (leftSortKey !== rightSortKey) {
@@ -3913,31 +4081,42 @@ function App() {
       });
   }, [items, selectedCollectionId]);
 
+  const viewScopedItems = useMemo(() => {
+    if (libraryViewMode !== "favorites") {
+      return collectionScopedItems;
+    }
+    return collectionScopedItems.filter((item) => item.isFavorite);
+  }, [collectionScopedItems, libraryViewMode]);
+
   const tagFilteredItems = useMemo(() => {
     if (!selectedTagId) {
-      return scopedItems;
+      return viewScopedItems;
     }
-    return scopedItems.filter((item) => item.tagIds.includes(selectedTagId));
-  }, [scopedItems, selectedTagId]);
+    return viewScopedItems.filter((item) => item.tagIds.includes(selectedTagId));
+  }, [viewScopedItems, selectedTagId]);
 
   const filteredItems = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    if (!query) return tagFilteredItems;
+    const searchFilteredItems = !query
+      ? tagFilteredItems
+      : tagFilteredItems.filter((item) =>
+          [
+            item.filename,
+            item.title,
+            item.description,
+            item.sourceUrl,
+            item.hostname,
+            item.noteText,
+            item.tags.join(" "),
+          ]
+            .filter(Boolean)
+            .some((value) => value!.toLowerCase().includes(query)),
+        );
 
-    return tagFilteredItems.filter((item) =>
-      [
-        item.filename,
-        item.title,
-        item.description,
-        item.sourceUrl,
-        item.hostname,
-        item.noteText,
-        item.tags.join(" "),
-      ]
-        .filter(Boolean)
-        .some((value) => value!.toLowerCase().includes(query)),
+    return searchFilteredItems.slice().sort((left, right) =>
+      compareItemsBySortOption(left, right, sortOption),
     );
-  }, [tagFilteredItems, searchQuery]);
+  }, [tagFilteredItems, searchQuery, sortOption]);
 
   const selectedItem =
     selectedIds.length === 1
@@ -4100,7 +4279,7 @@ function App() {
         return false;
       }
 
-      const orderedIds = scopedItems.map((item) => item.id);
+      const orderedIds = collectionScopedItems.map((item) => item.id);
       const fromIndex = orderedIds.indexOf(args.draggedItemId);
       const targetIndex = orderedIds.indexOf(args.targetItemId);
       if (fromIndex === -1 || targetIndex === -1 || fromIndex === targetIndex) {
@@ -4138,7 +4317,7 @@ function App() {
         setIsActionInProgress(false);
       }
     },
-    [reloadItemsFromDb, scopedItems, searchQuery, selectedCollectionId],
+    [collectionScopedItems, reloadItemsFromDb, searchQuery, selectedCollectionId],
   );
 
   const duplicateItemsIntoSelectedCollectionAtDrop = useCallback(
@@ -4166,7 +4345,7 @@ function App() {
       }
 
       const duplicatedItemId = duplicatedItems[0].id;
-      const orderedIds = scopedItems.map((item) => item.id);
+      const orderedIds = collectionScopedItems.map((item) => item.id);
       const targetIndex = orderedIds.indexOf(args.reorderTarget.itemId);
       if (targetIndex === -1) {
         return true;
@@ -4192,7 +4371,7 @@ function App() {
       }
       return true;
     },
-    [duplicateItemsById, reloadItemsFromDb, scopedItems, searchQuery, selectedCollectionId],
+    [collectionScopedItems, duplicateItemsById, reloadItemsFromDb, searchQuery, selectedCollectionId],
   );
 
   useEffect(() => {
@@ -4934,8 +5113,9 @@ function App() {
           selectedCollectionId={selectedCollectionId}
           selectedTagId={selectedTagId}
           isItemDragActive={isItemDragActive}
-          onSelectCollection={setSelectedCollectionId}
-          onSelectTag={setSelectedTagId}
+          onSelectCollection={handleSidebarSelectCollection}
+          onSelectTag={handleSidebarSelectTag}
+          onSelectMenuView={handleSidebarSelectMenuView}
           onCreateCollection={createCollection}
           onRenameCollection={renameCollection}
           onDeleteCollection={requestDeleteCollection}
@@ -4976,6 +5156,8 @@ function App() {
           onClearTagFilter={() => setSelectedTagId(null)}
           tileSize={tileSize}
           onTileSizeChange={setTileSize}
+          sortOption={sortOption}
+          onSortOptionChange={setSortOption}
           onAddUrl={handleAddUrl}
           onImport={() => {
             void handleImportFromPicker();
@@ -5024,6 +5206,8 @@ function App() {
         item={selectedItem}
         availableTags={tags}
         onDescriptionChange={handleDescriptionChange}
+        onSetItemRating={handleSetItemRating}
+        onToggleItemFavorite={handleToggleItemFavorite}
         onUpdateItemTags={updateItemTagIds}
         onOpenBookmarkUrl={handleOpenBookmarkUrl}
         onDeleteSelection={() => requestDeleteItems(selectedIds)}

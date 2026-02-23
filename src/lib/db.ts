@@ -52,6 +52,8 @@ export type DbItemRecord = {
   faviconPath: string | null;
   metaStatus: DbMetaStatus;
   description: string | null;
+  rating: number;
+  isFavorite: boolean;
   createdAt: number;
   updatedAt: number;
   tagIds: string[];
@@ -101,6 +103,8 @@ export type DbInsertItemInput = {
   faviconPath: string | null;
   metaStatus: DbMetaStatus;
   description: string | null;
+  rating: number;
+  isFavorite: boolean;
   createdAt: number;
   updatedAt: number;
   tags: string[];
@@ -315,6 +319,20 @@ export async function updateDbItemDescription(
   description: string,
 ): Promise<number> {
   return invoke<number>("update_item_description", { itemId, description });
+}
+
+export async function updateDbItemPreferences(input: {
+  itemId: string;
+  rating?: number;
+  isFavorite?: boolean;
+}): Promise<number> {
+  return invoke<number>("update_item_preferences", {
+    input: {
+      itemId: input.itemId,
+      rating: input.rating,
+      isFavorite: input.isFavorite,
+    },
+  });
 }
 
 export async function updateDbItemTags(itemId: string, tagIds: string[]): Promise<number> {

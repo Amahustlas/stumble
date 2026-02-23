@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import FavoriteBorderOutlinedIcon from "@mui/icons-material/FavoriteBorderOutlined";
+import FavoriteOutlinedIcon from "@mui/icons-material/FavoriteOutlined";
+import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
+import StarRoundedIcon from "@mui/icons-material/StarRounded";
 import type { Item } from "../App";
 import type { Tag } from "../lib/db";
 
@@ -7,6 +11,8 @@ type PreviewPanelProps = {
   item: Item | null;
   availableTags: Tag[];
   onDescriptionChange: (value: string) => void;
+  onSetItemRating: (itemId: string, rating: number) => void | Promise<void>;
+  onToggleItemFavorite: (itemId: string) => void | Promise<void>;
   onUpdateItemTags: (itemId: string, tagIds: string[]) => void | Promise<void>;
   onOpenBookmarkUrl: (url: string) => void | Promise<void>;
   onDeleteSelection: () => void;
@@ -29,6 +35,8 @@ function PreviewPanel({
   item,
   availableTags,
   onDescriptionChange,
+  onSetItemRating,
+  onToggleItemFavorite,
   onUpdateItemTags,
   onOpenBookmarkUrl,
   onDeleteSelection,
@@ -242,7 +250,57 @@ function PreviewPanel({
         </div>
         <div>
           <dt>Rating</dt>
-          <dd>{item.rating}</dd>
+          <dd>
+            <div className="preview-rating-controls" role="group" aria-label="Item rating">
+              {Array.from({ length: 5 }, (_, index) => {
+                const value = index + 1;
+                const selected = item.rating >= value;
+                const isExactSelection = item.rating === value;
+                return (
+                  <button
+                    key={value}
+                    type="button"
+                    className={`preview-star-button ${selected ? "active" : ""}`}
+                    aria-label={
+                      isExactSelection ? `Clear ${value}-star rating` : `Set rating to ${value}`
+                    }
+                    aria-pressed={isExactSelection}
+                    onClick={() => {
+                      void onSetItemRating(item.id, isExactSelection ? 0 : value);
+                    }}
+                  >
+                    {selected ? (
+                      <StarRoundedIcon fontSize="inherit" />
+                    ) : (
+                      <StarBorderRoundedIcon fontSize="inherit" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </dd>
+        </div>
+        <div>
+          <dt>Favorite</dt>
+          <dd>
+            <button
+              type="button"
+              className={`preview-favorite-toggle ${item.isFavorite ? "active" : ""}`}
+              aria-pressed={item.isFavorite}
+              onClick={() => {
+                void onToggleItemFavorite(item.id);
+              }}
+            >
+              <span className="preview-favorite-toggle-icon" aria-hidden="true">
+                {item.isFavorite ? (
+                  <FavoriteOutlinedIcon fontSize="inherit" />
+                ) : (
+                  <FavoriteBorderOutlinedIcon fontSize="inherit" />
+                )}
+              </span>
+              <span>{item.isFavorite ? "Favorite" : "Not favorite"}</span>
+            </button>
+          </dd>
         </div>
         <div>
           <dt>Tags</dt>

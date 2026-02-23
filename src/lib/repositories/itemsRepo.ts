@@ -9,6 +9,7 @@ import {
   updateDbItemsCollection,
   type DbDeleteItemsWithCleanupResult,
   updateDbItemDescription,
+  updateDbItemPreferences,
   updateDbItemTags,
   updateDbItemMediaState,
   updateDbItemBookmarkMetadata,
@@ -74,6 +75,14 @@ export async function updateItemDescription(
   description: string,
 ): Promise<number> {
   return updateDbItemDescription(itemId, description);
+}
+
+export async function updateItemPreferences(params: {
+  itemId: string;
+  rating?: number;
+  isFavorite?: boolean;
+}): Promise<number> {
+  return updateDbItemPreferences(params);
 }
 
 export async function updateItemTags(

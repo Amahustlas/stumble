@@ -76,6 +76,8 @@ struct DbItemRow {
     favicon_path: Option<String>,
     meta_status: String,
     description: Option<String>,
+    rating: i64,
+    is_favorite: bool,
     created_at: i64,
     updated_at: i64,
     tag_ids: Vec<String>,
@@ -134,6 +136,10 @@ struct InsertItemInput {
     favicon_path: Option<String>,
     meta_status: Option<String>,
     description: Option<String>,
+    #[serde(default)]
+    rating: i64,
+    #[serde(default)]
+    is_favorite: bool,
     created_at: i64,
     updated_at: i64,
     #[serde(default)]
@@ -211,6 +217,14 @@ struct DeleteTagInput {
 struct UpdateItemTagsInput {
     item_id: String,
     tag_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateItemPreferencesInput {
+    item_id: String,
+    rating: Option<i64>,
+    is_favorite: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -365,6 +379,8 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
                 favicon_path TEXT NULL,
                 meta_status TEXT NOT NULL DEFAULT 'ready',
                 description TEXT NULL,
+                rating INTEGER NOT NULL DEFAULT 0 CHECK(rating BETWEEN 0 AND 5),
+                is_favorite INTEGER NOT NULL DEFAULT 0 CHECK(is_favorite IN (0, 1)),
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE SET NULL
@@ -416,6 +432,7 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
         .map_err(|err| format!("failed to run sqlite migrations: {}", err))?;
     ensure_items_status_columns(connection)?;
     ensure_items_bookmark_columns(connection)?;
+    ensure_items_rating_favorite_columns(connection)?;
     ensure_collections_columns(connection)?;
     ensure_collection_items_columns(connection)?;
     ensure_tags_columns(connection)?;
@@ -450,6 +467,18 @@ fn normalize_meta_status(value: &str) -> String {
         "pending" => "pending".to_string(),
         "error" => "error".to_string(),
         _ => DEFAULT_META_STATUS.to_string(),
+    }
+}
+
+fn normalize_item_rating(value: i64) -> i64 {
+    value.clamp(0, 5)
+}
+
+fn normalize_is_favorite_int(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
     }
 }
 
@@ -554,6 +583,87 @@ fn ensure_items_bookmark_columns(connection: &Connection) -> Result<(), String> 
             [],
         )
         .map_err(|err| format!("failed to backfill items.meta_status values: {}", err))?;
+
+    Ok(())
+}
+
+fn ensure_items_rating_favorite_columns(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare("PRAGMA table_info(items)")
+        .map_err(|err| {
+            format!(
+                "failed to inspect items table info for rating/favorite columns: {}",
+                err
+            )
+        })?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| {
+            format!(
+                "failed to read items table info for rating/favorite columns: {}",
+                err
+            )
+        })?;
+
+    let mut has_rating = false;
+    let mut has_is_favorite = false;
+    for row_result in rows {
+        let column_name = row_result.map_err(|err| {
+            format!(
+                "failed to parse items table column for rating/favorite columns: {}",
+                err
+            )
+        })?;
+        if column_name == "rating" {
+            has_rating = true;
+        }
+        if column_name == "is_favorite" {
+            has_is_favorite = true;
+        }
+    }
+
+    if !has_rating {
+        connection
+            .execute(
+                "ALTER TABLE items ADD COLUMN rating INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|err| format!("failed to add items.rating column: {}", err))?;
+    }
+
+    if !has_is_favorite {
+        connection
+            .execute(
+                "ALTER TABLE items ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|err| format!("failed to add items.is_favorite column: {}", err))?;
+    }
+
+    connection
+        .execute(
+            "UPDATE items
+             SET rating = CASE
+                 WHEN rating IS NULL THEN 0
+                 WHEN CAST(rating AS INTEGER) < 0 THEN 0
+                 WHEN CAST(rating AS INTEGER) > 5 THEN 5
+                 ELSE CAST(rating AS INTEGER)
+             END",
+            [],
+        )
+        .map_err(|err| format!("failed to backfill items.rating values: {}", err))?;
+
+    connection
+        .execute(
+            "UPDATE items
+             SET is_favorite = CASE
+                 WHEN is_favorite IS NULL THEN 0
+                 WHEN CAST(is_favorite AS INTEGER) <> 0 THEN 1
+                 ELSE 0
+             END",
+            [],
+        )
+        .map_err(|err| format!("failed to backfill items.is_favorite values: {}", err))?;
 
     Ok(())
 }
@@ -2371,6 +2481,8 @@ fn load_app_state() -> Result<DbAppState, String> {
                 i.favicon_path,
                 i.meta_status,
                 i.description,
+                i.rating,
+                i.is_favorite,
                 i.created_at,
                 i.updated_at,
                 COALESCE(GROUP_CONCAT(it.tag_id, '|'), ''),
@@ -2385,8 +2497,8 @@ fn load_app_state() -> Result<DbAppState, String> {
 
     let items_iter = items_stmt
         .query_map([], |row| {
-            let tag_ids_raw: String = row.get(18)?;
-            let tag_names: String = row.get(19)?;
+            let tag_ids_raw: String = row.get(20)?;
+            let tag_names: String = row.get(21)?;
             let tag_ids = if tag_ids_raw.is_empty() {
                 Vec::new()
             } else {
@@ -2415,8 +2527,10 @@ fn load_app_state() -> Result<DbAppState, String> {
                 favicon_path: row.get(13)?,
                 meta_status: normalize_meta_status(&row.get::<_, String>(14)?),
                 description: row.get(15)?,
-                created_at: row.get(16)?,
-                updated_at: row.get(17)?,
+                rating: normalize_item_rating(row.get::<_, i64>(16)?),
+                is_favorite: row.get::<_, i64>(17)? != 0,
+                created_at: row.get(18)?,
+                updated_at: row.get(19)?,
                 tag_ids,
                 tags,
             })
@@ -3028,6 +3142,8 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
         favicon_path,
         meta_status,
         description,
+        rating,
+        is_favorite,
         created_at,
         updated_at,
         tags,
@@ -3054,9 +3170,11 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
                 favicon_path,
                 meta_status,
                 description,
+                rating,
+                is_favorite,
                 created_at,
                 updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 &id,
                 collection_id,
@@ -3077,6 +3195,8 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
                     .map(normalize_meta_status)
                     .unwrap_or_else(|| DEFAULT_META_STATUS.to_string()),
                 description,
+                normalize_item_rating(rating),
+                normalize_is_favorite_int(is_favorite),
                 created_at,
                 updated_at,
             ],
@@ -3852,6 +3972,36 @@ fn update_item_description(item_id: String, description: String) -> Result<i64, 
 }
 
 #[tauri::command]
+fn update_item_preferences(input: UpdateItemPreferencesInput) -> Result<i64, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+    let updated_at = Utc::now().timestamp_millis();
+
+    let normalized_rating = input.rating.map(normalize_item_rating);
+    let normalized_is_favorite = input.is_favorite.map(normalize_is_favorite_int);
+    if normalized_rating.is_none() && normalized_is_favorite.is_none() {
+        return Err("no item preference fields provided".to_string());
+    }
+
+    let affected_rows = connection
+        .execute(
+            "UPDATE items
+             SET rating = COALESCE(?1, rating),
+                 is_favorite = COALESCE(?2, is_favorite),
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![normalized_rating, normalized_is_favorite, updated_at, input.item_id],
+        )
+        .map_err(|err| format!("failed to update item preferences: {}", err))?;
+
+    if affected_rows == 0 {
+        return Err("item not found while updating preferences".to_string());
+    }
+
+    Ok(updated_at)
+}
+
+#[tauri::command]
 fn update_item_bookmark_metadata(input: UpdateItemBookmarkMetadataInput) -> Result<i64, String> {
     initialize_db()?;
     let connection = open_db_connection()?;
@@ -4295,6 +4445,7 @@ pub fn run() {
             update_items_collection,
             update_item_tags,
             update_item_description,
+            update_item_preferences,
             update_item_bookmark_metadata,
             update_item_media_state,
             finalize_item_import,

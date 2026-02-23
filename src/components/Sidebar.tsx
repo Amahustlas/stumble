@@ -23,6 +23,7 @@ type SidebarProps = {
   isItemDragActive?: boolean;
   onSelectCollection: (collectionId: string | null) => void;
   onSelectTag: (tagId: string | null) => void;
+  onSelectMenuView?: (menuLabel: string) => void;
   onCreateCollection: (parentId: string | null) => Promise<Collection | null>;
   onRenameCollection: (id: string, name: string) => Promise<boolean>;
   onDeleteCollection: (id: string, name: string) => void;
@@ -151,6 +152,7 @@ function Sidebar({
   isItemDragActive = false,
   onSelectCollection,
   onSelectTag,
+  onSelectMenuView,
   onCreateCollection,
   onRenameCollection,
   onDeleteCollection,
@@ -272,7 +274,14 @@ function Sidebar({
 
   const handleMenuClick = (menuLabel: string) => {
     setActiveMenu(menuLabel);
-    if (menuLabel === "All Items") {
+    onSelectMenuView?.(menuLabel);
+    if (
+      menuLabel === "All Items" ||
+      menuLabel === "Favorites" ||
+      menuLabel === "Recents" ||
+      menuLabel === "Archive" ||
+      menuLabel === "Trash"
+    ) {
       onSelectTag(null);
       onSelectCollection(null);
     }

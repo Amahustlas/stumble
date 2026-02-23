@@ -1,5 +1,7 @@
 import { useState } from "react";
+import FavoriteRoundedIcon from "@mui/icons-material/FavoriteRounded";
 import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
+import StarRoundedIcon from "@mui/icons-material/StarRounded";
 import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
 import type { Item } from "../App";
 
@@ -181,7 +183,6 @@ function ItemGrid({
               onDoubleClick={() => onItemDoubleClick(item)}
               onContextMenu={(event) => onItemContextMenu(item, event)}
               onPointerDown={(event) => {
-                console.log("[dnd][tile][pointerdown]", { itemId: item.id, button: event.button });
                 onItemPointerDown(item, event);
               }}
               onDragStart={(event) => {
@@ -250,6 +251,23 @@ function ItemGrid({
                   <p className="note-snippet">{item.noteText || item.description}</p>
                 ) : (
                   <span className="thumbnail-label">{item.type}</span>
+                )}
+                {item.isFavorite && (
+                  <span
+                    className="item-tile-indicator item-tile-favorite-indicator"
+                    aria-hidden="true"
+                  >
+                    <FavoriteRoundedIcon fontSize="inherit" />
+                  </span>
+                )}
+                {item.rating > 0 && (
+                  <span
+                    className="item-tile-indicator item-tile-rating-indicator"
+                    aria-hidden="true"
+                  >
+                    <StarRoundedIcon fontSize="inherit" />
+                    <span>{item.rating}</span>
+                  </span>
                 )}
                 {(isImporting || isBookmarkMetaPending) && (
                   <div className="thumbnail-status-overlay pending" aria-hidden="true">

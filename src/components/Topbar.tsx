@@ -1,5 +1,7 @@
 import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
 
+export type TopbarSortOption = "newest" | "oldest" | "name-asc" | "rating-desc";
+
 type TopbarTagFilter = {
   id: string;
   name: string;
@@ -13,6 +15,8 @@ type TopbarProps = {
   onClearTagFilter?: () => void;
   tileSize: number;
   onTileSizeChange: (value: number) => void;
+  sortOption: TopbarSortOption;
+  onSortOptionChange: (value: TopbarSortOption) => void;
   onAddUrl: () => void;
   onImport: () => void;
 };
@@ -24,6 +28,8 @@ function Topbar({
   onClearTagFilter,
   tileSize,
   onTileSizeChange,
+  sortOption,
+  onSortOptionChange,
   onAddUrl,
   onImport,
 }: TopbarProps) {
@@ -45,6 +51,19 @@ function Topbar({
         <button type="button" onClick={onImport}>
           Import
         </button>
+        <label className="topbar-sort-control" htmlFor="item-sort">
+          Sort
+          <select
+            id="item-sort"
+            value={sortOption}
+            onChange={(event) => onSortOptionChange(event.currentTarget.value as TopbarSortOption)}
+          >
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="name-asc">Name A→Z</option>
+            <option value="rating-desc">Rating high→low</option>
+          </select>
+        </label>
         <label className="tile-size-control" htmlFor="tile-size">
           Tile size
           <input

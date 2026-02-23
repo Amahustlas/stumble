@@ -85,7 +85,8 @@ textarea {
 }
 
 .sidebar.drag-active .sidebar-list,
-.sidebar.drag-active .tag-list {
+.sidebar.drag-active .tag-list,
+.sidebar.drag-active .tag-row-list {
   pointer-events: none;
 }
 
@@ -172,6 +173,20 @@ textarea {
   font-size: 14px;
   cursor: pointer;
   padding: 0;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.sidebar-heading-row:hover .sidebar-heading-action,
+.sidebar-heading-row:focus-within .sidebar-heading-action {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
 }
 
 .sidebar-heading-action:hover {
@@ -184,6 +199,29 @@ textarea {
   background: transparent;
   padding: 0;
   cursor: pointer;
+}
+
+.sidebar-heading-toggle-button {
+  flex: 1;
+  text-align: left;
+  color: var(--color-muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 500;
+  opacity: 0.85;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.sidebar-heading-toggle-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
 }
 
 .sidebar-list,
@@ -417,6 +455,108 @@ textarea {
   border-color: var(--color-accent);
 }
 
+.tag-row-list {
+  margin: 0;
+  padding: 0 6px;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tag-empty {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 11px;
+  width: 100%;
+}
+
+.tag-row {
+  --tag-chip-color: var(--color-accent);
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--tag-chip-color) 34%, var(--color-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tag-chip-color) 12%, var(--color-chip));
+  color: color-mix(in srgb, var(--tag-chip-color) 18%, var(--color-text));
+  padding: 2px 8px 2px 7px;
+  cursor: pointer;
+  text-align: left;
+  max-width: 100%;
+  user-select: none;
+  -webkit-user-drag: none;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease,
+    opacity 120ms ease;
+}
+
+.tag-row * {
+  -webkit-user-drag: none;
+}
+
+.tag-row:hover {
+  color: var(--color-text);
+  border-color: color-mix(in srgb, var(--tag-chip-color) 48%, var(--color-border));
+  background:
+    color-mix(in srgb, var(--tag-chip-color) 16%, var(--color-chip));
+}
+
+.tag-row.active {
+  color: var(--color-text);
+  border-color: color-mix(in srgb, var(--tag-chip-color) 62%, var(--color-border));
+  background: color-mix(in srgb, var(--tag-chip-color) 22%, var(--color-chip));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--tag-chip-color) 18%, transparent);
+}
+
+.tag-row.dragging {
+  opacity: 0.55;
+}
+
+.tag-row.drop-before {
+  box-shadow:
+    inset 2px 0 0 0 color-mix(in srgb, var(--tag-chip-color) 75%, #fff),
+    0 0 0 1px color-mix(in srgb, var(--tag-chip-color) 18%, transparent);
+}
+
+.tag-row.drop-after {
+  box-shadow:
+    inset -2px 0 0 0 color-mix(in srgb, var(--tag-chip-color) 75%, #fff),
+    0 0 0 1px color-mix(in srgb, var(--tag-chip-color) 18%, transparent);
+}
+
+.tag-row-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #000 35%, var(--color-border));
+  flex: 0 0 auto;
+}
+
+.tag-row-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  max-width: 140px;
+}
+
+.tag-rename-input {
+  width: 120px;
+  min-width: 60px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: var(--color-panel-elevated);
+  color: var(--color-text);
+  font-size: 12px;
+}
+
 .content-layout {
   grid-column: 3;
   display: grid;
@@ -432,6 +572,10 @@ textarea {
   padding: 12px 14px;
   border-bottom: 1px solid var(--color-border);
   background: var(--color-panel);
+}
+
+.topbar.has-filters {
+  grid-template-rows: auto auto;
 }
 
 .topbar-search input {
@@ -451,6 +595,38 @@ textarea {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.topbar-filter-row {
+  grid-column: 1 / -1;
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding-top: 2px;
+}
+
+.topbar-filter-chip {
+  flex: 0 0 auto;
+}
+
+.topbar-filter-chip-close {
+  width: 14px;
+  height: 14px;
+  margin-left: 1px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--color-muted);
+  background: color-mix(in srgb, var(--color-panel) 40%, transparent);
+}
+
+.topbar-filter-chip:hover .topbar-filter-chip-close,
+.topbar-filter-chip.active .topbar-filter-chip-close {
+  color: var(--color-text);
 }
 
 .topbar-actions button {
@@ -518,6 +694,14 @@ textarea {
 .item-card.selected {
   border-color: color-mix(in srgb, var(--color-accent) 60%, var(--color-border));
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 28%, transparent);
+}
+
+.item-card.item-card-tag-drop-target {
+  border-color: color-mix(in srgb, var(--color-accent) 70%, var(--color-border));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--color-accent) 25%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
+  background: color-mix(in srgb, var(--color-selected) 35%, var(--color-panel));
 }
 
 .item-card.reorder-target {
@@ -596,6 +780,23 @@ textarea {
   font-size: 12px;
   line-height: 1.2;
   font-weight: 600;
+}
+
+.custom-tag-drag-ghost {
+  position: fixed;
+  z-index: 2001;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 75%, transparent);
+  background: color-mix(in srgb, var(--color-panel-elevated) 92%, #000);
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.34);
+  padding: 4px 9px;
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.2;
 }
 
 .thumbnail-status-overlay {
@@ -891,23 +1092,24 @@ textarea {
   margin: 0;
 }
 
-.preview-metadata div {
+.preview-metadata > div {
   display: grid;
   grid-template-columns: 110px minmax(0, 1fr);
   gap: 8px;
   padding: 5px 0;
   border-bottom: 1px solid var(--color-border);
   font-size: 13px;
+  align-items: start;
 }
 
-.preview-metadata dt {
+.preview-metadata > div > dt {
   color: var(--color-muted);
 }
 
-.preview-metadata dd {
+.preview-metadata > div > dd {
   margin: 0;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .preview-link-button {
@@ -926,6 +1128,128 @@ textarea {
 
 .preview-link-button:hover {
   text-decoration: underline;
+}
+
+.preview-tags-editor {
+  display: grid;
+  gap: 6px;
+  overflow: visible;
+}
+
+.preview-tag-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.preview-tag-chip {
+  --tag-chip-color: var(--color-accent);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid color-mix(in srgb, var(--tag-chip-color) 32%, var(--color-border));
+  background: color-mix(in srgb, var(--tag-chip-color) 10%, var(--color-chip));
+  border-radius: 999px;
+  padding: 2px 4px 2px 6px;
+  max-width: 100%;
+}
+
+.preview-tag-chip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #000 35%, var(--color-border));
+  flex: 0 0 auto;
+}
+
+.preview-tag-chip-label {
+  font-size: 11px;
+  color: var(--color-text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-tag-chip-remove {
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.preview-tag-chip-remove:hover {
+  background: color-mix(in srgb, var(--color-hover) 70%, transparent);
+  color: var(--color-text);
+}
+
+.preview-tag-input-wrap {
+  position: relative;
+}
+
+.preview-tag-input {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  background: var(--color-panel-elevated);
+  color: var(--color-text);
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.preview-tag-input:focus {
+  outline: 1px solid color-mix(in srgb, var(--color-accent) 55%, transparent);
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-border));
+}
+
+.preview-tag-suggestions {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-panel);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.34);
+  padding: 4px;
+  z-index: 5;
+  display: grid;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.preview-tag-suggestion {
+  width: 100%;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 7px;
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.preview-tag-suggestion:hover,
+.preview-tag-suggestion.active {
+  background: color-mix(in srgb, var(--color-hover) 65%, transparent);
+}
+
+.preview-tag-suggestion-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #000 35%, var(--color-border));
 }
 
 .description-editor {
@@ -1101,6 +1425,54 @@ textarea {
 .context-menu-shortcut {
   font-size: 11px;
   color: var(--color-muted);
+}
+
+.tag-context-menu {
+  width: 240px;
+}
+
+.tag-context-color-section {
+  margin: 4px 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
+  border-radius: 8px;
+  padding: 6px;
+  background: color-mix(in srgb, var(--color-panel-elevated) 65%, transparent);
+}
+
+.tag-context-color-title {
+  color: var(--color-muted);
+  font-size: 11px;
+  margin-bottom: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tag-context-color-title-icon {
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tag-context-color-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 5px;
+}
+
+.tag-context-color-swatch {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, #000 35%, var(--color-border));
+  cursor: pointer;
+  padding: 0;
+}
+
+.tag-context-color-swatch.active {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 65%, transparent);
 }
 
 .action-modal-backdrop {

@@ -28,7 +28,7 @@ No cloud sync in MVP.
 - Tauri (desktop wrapper)
 - React
 - TypeScript
-- SQLite (local database, later phase)
+- SQLite (local database, actively used for persisted app data)
 - Local filesystem storage for imported files
 
 Target platform: Windows (for now).
@@ -83,6 +83,10 @@ Rules:
 
 - id
 - name
+- color
+- createdAt
+- updatedAt
+- sortIndex (for sidebar ordering / drag reordering)
 
 Many-to-many relation with Item.
 
@@ -172,23 +176,18 @@ Visual direction:
 
 ## Current Phase
 
-Phase 1 - UI scaffold only (no database integration yet)
+Phase 2 - SQLite-backed core UX iteration
 
-Build now:
-- layout scaffold
-- mock data
-- basic search state
-- single + multi-select UI behavior
-- preview panel field layout
-- import entry points (button + drag/drop UI behavior)
+Current reality (implemented/in progress):
+- SQLite persistence is wired for core entities (items, collections, tags)
+- local filesystem storage + import pipeline is in use
+- thumbnail and bookmark metadata flows exist (still being refined)
+- sidebar + preview panel UX is being iterated for speed and consistency
 
-Out of scope for Phase 1:
-- SQLite wiring
-- persistent storage logic
-- background processing for thumbnail generation
-- annotation feature implementation
-
-UI/state design must make Phase 2 DB integration straightforward.
+Current focus:
+- polish organization UX (collections/tags)
+- reduce visual regressions while shipping features
+- keep interactions fast and local-first
 
 ---
 
@@ -216,6 +215,9 @@ Keep the app simple and shippable.
 - Keep UI separate from domain/state logic where practical.
 - Do not introduce new libraries unless clearly required.
 - Design state and component boundaries so DB integration can be added with minimal refactor.
+- Reuse existing icons/components/patterns when available (especially context menus, dialogs, and action icons) to keep the UI visually consistent.
+- Prefer existing custom confirm dialog + snackbar patterns over native browser dialogs for app actions.
+- In dark mode, use subtle/saturated-low color tints for chip backgrounds (avoid overly bright fills).
 
 ---
 
@@ -227,3 +229,4 @@ When generating code:
 - Do not change architecture without explicit instruction.
 - If unsure, propose a sensible default and continue.
 - Keep responses concise and implementation-focused.
+- Reuse existing iconography and UI patterns before introducing new alternatives.

@@ -15,6 +15,7 @@ import {
   type DbCollectionItemRecord,
   type DbInsertItemInput,
   type DbItemRecord,
+  type Tag,
 } from "./lib/db";
 import {
   createCollection as createCollectionInDb,
@@ -32,9 +33,18 @@ import {
   addItemsToCollection as addItemsToCollectionInDb,
   reorderCollectionItems as reorderCollectionItemsInDb,
   updateItemDescription as updateItemDescriptionInDb,
+  updateItemTags as updateItemTagsInDb,
   updateItemBookmarkMetadata as updateItemBookmarkMetadataInDb,
   updateItemMediaState as updateItemMediaStateInDb,
 } from "./lib/repositories/itemsRepo";
+import {
+  createTag as createTagInDb,
+  deleteTag as deleteTagInDb,
+  duplicateTag as duplicateTagInDb,
+  reorderTags as reorderTagsInDb,
+  updateTagColor as updateTagColorInDb,
+  updateTagName as updateTagNameInDb,
+} from "./lib/repositories/tagsRepo";
 import { fetchBookmarkMetadata, type BookmarkMetadataFetchResult } from "./lib/bookmarks";
 import {
   buildVaultKey,
@@ -84,6 +94,7 @@ export type Item = {
   rating: number;
   status: ItemStatus;
   importStatus: ImportStatus;
+  tagIds: string[];
   tags: string[];
   collectionId: string | null;
   collectionPath: string;
@@ -525,6 +536,20 @@ const RIGHT_PANEL_WIDTH_STORAGE_KEY = "stumble:right-panel-width";
 const DEFAULT_COLLECTION_ICON = "folder";
 const DEFAULT_COLLECTION_COLOR = "#8B8B8B";
 const DEFAULT_COLLECTION_NAME = "New Collection";
+const DEFAULT_TAG_COLOR = "#64748b";
+const DEFAULT_TAG_NAME = "New tag";
+const TAG_COLOR_PALETTE = [
+  "#ef4444",
+  "#f97316",
+  "#f59e0b",
+  "#eab308",
+  "#84cc16",
+  "#22c55e",
+  "#14b8a6",
+  "#06b6d4",
+  "#3b82f6",
+  "#a855f7",
+] as const;
 
 function nextCollectionName(collections: Collection[]): string {
   const normalizedNames = new Set(
@@ -539,6 +564,29 @@ function nextCollectionName(collections: Collection[]): string {
     suffix += 1;
   }
   return `${DEFAULT_COLLECTION_NAME} ${suffix}`;
+}
+
+function nextTagName(tags: Tag[]): string {
+  const normalizedNames = new Set(tags.map((tag) => tag.name.trim().toLowerCase()));
+  if (!normalizedNames.has(DEFAULT_TAG_NAME.toLowerCase())) {
+    return DEFAULT_TAG_NAME;
+  }
+
+  let suffix = 2;
+  while (normalizedNames.has(`${DEFAULT_TAG_NAME.toLowerCase()} ${suffix}`)) {
+    suffix += 1;
+  }
+  return `${DEFAULT_TAG_NAME} ${suffix}`;
+}
+
+function sortTagsByOrder(tags: Tag[]): Tag[] {
+  return tags
+    .slice()
+    .sort((left, right) =>
+      left.sortIndex !== right.sortIndex
+        ? left.sortIndex - right.sortIndex
+        : left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+    );
 }
 
 function createItemId(): string {
@@ -871,7 +919,8 @@ function createImportPlaceholderItem(args: {
     rating: 0,
     status: "processing",
     importStatus: "processing",
-    tags: ["imported"],
+    tagIds: [],
+    tags: [],
     collectionId,
     collectionPath,
     collectionIds: collectionId ? [collectionId] : [],
@@ -915,6 +964,7 @@ function createBookmarkPlaceholderItem(args: {
     rating: 0,
     status: "processing",
     importStatus: "ready",
+    tagIds: [],
     tags: [],
     collectionId,
     collectionPath,
@@ -1130,6 +1180,7 @@ function mapDbItemToItem(args: {
     rating: 0,
     status: deriveItemStatus({ itemType, importStatus, metaStatus }),
     importStatus,
+    tagIds: item.tagIds ?? [],
     tags: item.tags ?? [],
     collectionId: primaryCollectionId,
     collectionPath:
@@ -1161,6 +1212,7 @@ function mapDbItemToItem(args: {
 
 function App() {
   const [collections, setCollections] = useState<Collection[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
   const [items, setItems] = useState<Item[]>(initialItems);
   const [searchQuery, setSearchQuery] = useState("");
   const [tileSize, setTileSize] = useState(220);
@@ -1175,8 +1227,14 @@ function App() {
     itemsCount: number;
     subcollectionsCount: number;
   } | null>(null);
+  const [deleteTagConfirm, setDeleteTagConfirm] = useState<{
+    tagId: string;
+    tagName: string;
+    itemsCount: number;
+  } | null>(null);
   const [isActionInProgress, setIsActionInProgress] = useState(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState<string | null>(null);
+  const [selectedTagId, setSelectedTagId] = useState<string | null>(null);
   const [isItemDragActive, setIsItemDragActive] = useState(false);
   const [customItemDragState, setCustomItemDragState] = useState<CustomItemDragState | null>(null);
   const [snackbar, setSnackbar] = useState<SnackbarState | null>(null);
@@ -1253,11 +1311,19 @@ function App() {
     () => buildCollectionPathMap(collections),
     [collections],
   );
+  const tagById = useMemo(() => {
+    const map = new Map<string, Tag>();
+    tags.forEach((tag) => {
+      map.set(tag.id, tag);
+    });
+    return map;
+  }, [tags]);
 
   const selectedCollectionPath =
     selectedCollectionId !== null
       ? collectionPathById.get(selectedCollectionId) ?? "All Items"
       : "All Items";
+  const activeTagFilter = selectedTagId ? tagById.get(selectedTagId) ?? null : null;
 
   const reloadItemsFromDb = useCallback(
     async (collectionsOverride?: Collection[]) => {
@@ -1275,10 +1341,17 @@ function App() {
           thumbsRoot: thumbsRootRef.current,
         }),
       );
+      setTags(persistedState.tags ?? []);
       setItems(mappedItems);
     },
     [collections],
   );
+
+  useEffect(() => {
+    if (selectedTagId && !tags.some((tag) => tag.id === selectedTagId)) {
+      setSelectedTagId(null);
+    }
+  }, [tags, selectedTagId]);
 
   useEffect(() => {
     try {
@@ -2412,6 +2485,266 @@ function App() {
     setSnackbar((current) => (current?.id === pending.id ? null : current));
   }, []);
 
+  const createTag = useCallback(async (): Promise<Tag | null> => {
+    const generatedName = nextTagName(tags);
+    try {
+      const createdTag = await createTagInDb({
+        name: generatedName,
+        color: TAG_COLOR_PALETTE[0] ?? DEFAULT_TAG_COLOR,
+      });
+      setTags((currentTags) => sortTagsByOrder([...currentTags, createdTag]));
+      await showInfoSnackbar({ message: `Tag created: ${createdTag.name}` });
+      return createdTag;
+    } catch (error) {
+      console.error("Failed to create tag:", error);
+      return null;
+    }
+  }, [showInfoSnackbar, tags]);
+
+  const renameTag = useCallback(
+    async (id: string, nextName: string): Promise<boolean> => {
+      const trimmedName = nextName.trim();
+      if (trimmedName.length === 0) {
+        return false;
+      }
+
+      const currentTag = tagById.get(id);
+      if (!currentTag) {
+        return false;
+      }
+
+      if (trimmedName === currentTag.name) {
+        return true;
+      }
+
+      try {
+        const updatedAt = await updateTagNameInDb(id, trimmedName);
+        setTags((currentTags) =>
+          currentTags.map((tag) =>
+            tag.id === id ? { ...tag, name: trimmedName, updatedAt } : tag,
+          ),
+        );
+        setItems((currentItems) =>
+          currentItems.map((item) => {
+            const tagIndex = item.tagIds.indexOf(id);
+            if (tagIndex < 0) return item;
+            const nextTags = item.tags.slice();
+            nextTags[tagIndex] = trimmedName;
+            return { ...item, tags: nextTags };
+          }),
+        );
+        await showInfoSnackbar({ message: `Tag renamed: ${trimmedName}` });
+        return true;
+      } catch (error) {
+        console.error("Failed to rename tag:", error);
+        return false;
+      }
+    },
+    [showInfoSnackbar, tagById],
+  );
+
+  const duplicateTag = useCallback(
+    async (id: string): Promise<Tag | null> => {
+      try {
+        const duplicated = await duplicateTagInDb(id);
+        setTags((currentTags) => sortTagsByOrder([...currentTags, duplicated]));
+        await showInfoSnackbar({ message: `Tag duplicated: ${duplicated.name}` });
+        return duplicated;
+      } catch (error) {
+        console.error("Failed to duplicate tag:", error);
+        return null;
+      }
+    },
+    [showInfoSnackbar],
+  );
+
+  const updateTagColor = useCallback(
+    async (id: string, color: string): Promise<boolean> => {
+      const currentTag = tagById.get(id);
+      if (!currentTag || currentTag.color === color) {
+        return false;
+      }
+      try {
+        const updatedAt = await updateTagColorInDb(id, color);
+        setTags((currentTags) =>
+          currentTags.map((tag) => (tag.id === id ? { ...tag, color, updatedAt } : tag)),
+        );
+        await showInfoSnackbar({ message: `Tag color updated: ${currentTag.name}` });
+        return true;
+      } catch (error) {
+        console.error("Failed to update tag color:", error);
+        return false;
+      }
+    },
+    [showInfoSnackbar, tagById],
+  );
+
+  const reorderTags = useCallback(
+    async (orderedTagIds: string[]) => {
+      const normalizedOrderedIds = Array.from(new Set(orderedTagIds));
+      if (normalizedOrderedIds.length < 2) {
+        return;
+      }
+
+      const currentTags = tags;
+      const currentTagIds = currentTags.map((tag) => tag.id);
+      if (
+        currentTagIds.length !== normalizedOrderedIds.length ||
+        currentTagIds.some((id) => !normalizedOrderedIds.includes(id))
+      ) {
+        return;
+      }
+
+      const currentById = new Map(currentTags.map((tag) => [tag.id, tag] as const));
+      const optimisticTags = normalizedOrderedIds.map((tagId, index) => {
+        const tag = currentById.get(tagId);
+        if (!tag) {
+          return null;
+        }
+        return { ...tag, sortIndex: index };
+      });
+      if (optimisticTags.some((tag) => tag === null)) {
+        return;
+      }
+
+      const previousTags = currentTags;
+      setTags(optimisticTags as Tag[]);
+
+      try {
+        const result = await reorderTagsInDb(normalizedOrderedIds);
+        setTags((latestTags) =>
+          latestTags.map((tag) => ({
+            ...tag,
+            updatedAt:
+              normalizedOrderedIds.includes(tag.id)
+                ? result.updatedAt
+                : tag.updatedAt,
+          })),
+        );
+      } catch (error) {
+        console.error("Failed to reorder tags:", error);
+        setTags(previousTags);
+      }
+    },
+    [tags],
+  );
+
+  const requestDeleteTag = useCallback(
+    (id: string) => {
+      const targetTag = tagById.get(id);
+      if (!targetTag) {
+        return;
+      }
+      const itemsCount = items.reduce(
+        (count, item) => (item.tagIds.includes(id) ? count + 1 : count),
+        0,
+      );
+      setDeleteTagConfirm({
+        tagId: id,
+        tagName: targetTag.name,
+        itemsCount,
+      });
+    },
+    [items, tagById],
+  );
+
+  const handleConfirmDeleteTag = useCallback(async () => {
+    if (!deleteTagConfirm || isActionInProgress) {
+      return;
+    }
+
+    setIsActionInProgress(true);
+    const { tagId, tagName } = deleteTagConfirm;
+    try {
+      await deleteTagInDb(tagId);
+      setTags((currentTags) => currentTags.filter((tag) => tag.id !== tagId));
+      setItems((currentItems) =>
+        currentItems.map((item) => {
+          const nextTagIds: string[] = [];
+          const nextTags: string[] = [];
+          item.tagIds.forEach((entryTagId, index) => {
+            if (entryTagId === tagId) {
+              return;
+            }
+            nextTagIds.push(entryTagId);
+            const tagNameAtIndex = item.tags[index];
+            if (typeof tagNameAtIndex === "string") {
+              nextTags.push(tagNameAtIndex);
+            }
+          });
+          if (nextTagIds.length === item.tagIds.length) {
+            return item;
+          }
+          return {
+            ...item,
+            tagIds: nextTagIds,
+            tags: nextTags,
+          };
+        }),
+      );
+      if (selectedTagId === tagId) {
+        setSelectedTagId(null);
+      }
+      setDeleteTagConfirm(null);
+      await showInfoSnackbar({ message: `Tag deleted: ${tagName}` });
+    } catch (error) {
+      console.error("Failed to delete tag:", error);
+    } finally {
+      setIsActionInProgress(false);
+    }
+  }, [deleteTagConfirm, isActionInProgress, selectedTagId, showInfoSnackbar]);
+
+  const updateItemTagIds = useCallback(
+    async (itemId: string, nextTagIds: string[]) => {
+      const uniqueTagIds = Array.from(new Set(nextTagIds));
+      const currentItem = itemsRef.current.find((item) => item.id === itemId);
+      if (!currentItem) {
+        return;
+      }
+
+      const sameTags =
+        currentItem.tagIds.length === uniqueTagIds.length &&
+        currentItem.tagIds.every((tagId, index) => tagId === uniqueTagIds[index]);
+      if (sameTags) {
+        return;
+      }
+
+      try {
+        const updatedAt = await updateItemTagsInDb(itemId, uniqueTagIds);
+        setItems((currentItems) =>
+          currentItems.map((item) => {
+            if (item.id !== itemId) {
+              return item;
+            }
+            const nextTagNames = uniqueTagIds
+              .map((tagId) => tagById.get(tagId)?.name)
+              .filter((value): value is string => Boolean(value));
+            return {
+              ...item,
+              tagIds: uniqueTagIds,
+              tags: nextTagNames,
+              updatedAt: formatDateFromTimestampMs(updatedAt),
+            };
+          }),
+        );
+      } catch (error) {
+        console.error("Failed to update item tags:", error);
+      }
+    },
+    [tagById],
+  );
+
+  const addTagToItem = useCallback(
+    async (itemId: string, tagId: string) => {
+      const targetItem = itemsRef.current.find((item) => item.id === itemId);
+      if (!targetItem || targetItem.tagIds.includes(tagId)) {
+        return;
+      }
+      await updateItemTagIds(itemId, [...targetItem.tagIds, tagId]);
+    },
+    [updateItemTagIds],
+  );
+
   const normalizeTargetItemIds = useCallback((itemIds: string[]): string[] => {
     const deduped = Array.from(new Set(itemIds));
     if (deduped.length === 0) return [];
@@ -3248,6 +3581,7 @@ function App() {
         });
 
         setCollections(collectionRows);
+        setTags(persistedState.tags ?? []);
         setItems(loadedItems);
       } catch (error) {
         console.error("Failed to initialize sqlite persistence:", error);
@@ -3579,23 +3913,18 @@ function App() {
       });
   }, [items, selectedCollectionId]);
 
-  const tags = useMemo(() => {
-    const uniqueTags = new Set<string>();
-    items.forEach((item) => {
-      item.tags.forEach((tag) => {
-        if (tag.trim().length > 0) {
-          uniqueTags.add(tag);
-        }
-      });
-    });
-    return Array.from(uniqueTags).sort((a, b) => a.localeCompare(b));
-  }, [items]);
+  const tagFilteredItems = useMemo(() => {
+    if (!selectedTagId) {
+      return scopedItems;
+    }
+    return scopedItems.filter((item) => item.tagIds.includes(selectedTagId));
+  }, [scopedItems, selectedTagId]);
 
   const filteredItems = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    if (!query) return scopedItems;
+    if (!query) return tagFilteredItems;
 
-    return scopedItems.filter((item) =>
+    return tagFilteredItems.filter((item) =>
       [
         item.filename,
         item.title,
@@ -3608,7 +3937,7 @@ function App() {
         .filter(Boolean)
         .some((value) => value!.toLowerCase().includes(query)),
     );
-  }, [scopedItems, searchQuery]);
+  }, [tagFilteredItems, searchQuery]);
 
   const selectedItem =
     selectedIds.length === 1
@@ -4598,17 +4927,27 @@ function App() {
         } as React.CSSProperties
       }
     >
-      <Sidebar
-        collections={collectionTree}
-        tags={tags}
-        selectedCollectionId={selectedCollectionId}
-        isItemDragActive={isItemDragActive}
-        onSelectCollection={setSelectedCollectionId}
-        onCreateCollection={createCollection}
-        onRenameCollection={renameCollection}
-        onDeleteCollection={requestDeleteCollection}
-        collectionDropTargetId={sidebarCollectionDropState?.collectionId ?? null}
-        collectionDropMode={sidebarCollectionDropState?.mode ?? null}
+        <Sidebar
+          collections={collectionTree}
+          tags={tags}
+          tagColorPalette={TAG_COLOR_PALETTE}
+          selectedCollectionId={selectedCollectionId}
+          selectedTagId={selectedTagId}
+          isItemDragActive={isItemDragActive}
+          onSelectCollection={setSelectedCollectionId}
+          onSelectTag={setSelectedTagId}
+          onCreateCollection={createCollection}
+          onRenameCollection={renameCollection}
+          onDeleteCollection={requestDeleteCollection}
+          onCreateTag={createTag}
+          onRenameTag={renameTag}
+          onDuplicateTag={duplicateTag}
+          onUpdateTagColor={updateTagColor}
+          onDeleteTag={requestDeleteTag}
+          onReorderTags={reorderTags}
+          onDropTagOnItem={addTagToItem}
+          collectionDropTargetId={sidebarCollectionDropState?.collectionId ?? null}
+          collectionDropMode={sidebarCollectionDropState?.mode ?? null}
         onCollectionDragOver={handleSidebarCollectionDragOver}
         onCollectionDragLeave={handleSidebarCollectionDragLeave}
         onCollectionDrop={handleSidebarCollectionDrop}
@@ -4625,6 +4964,16 @@ function App() {
         <Topbar
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
+          activeTagFilter={
+            activeTagFilter
+              ? {
+                  id: activeTagFilter.id,
+                  name: activeTagFilter.name,
+                  color: activeTagFilter.color,
+                }
+              : null
+          }
+          onClearTagFilter={() => setSelectedTagId(null)}
           tileSize={tileSize}
           onTileSizeChange={setTileSize}
           onAddUrl={handleAddUrl}
@@ -4658,6 +5007,7 @@ function App() {
           onItemContextMenu={handleItemContextMenu}
           onImageThumbnailMissing={handleImageThumbnailMissing}
           onDropFiles={handleDropFiles}
+          onDropTagOnItem={addTagToItem}
         />
       </section>
 
@@ -4672,7 +5022,9 @@ function App() {
       <PreviewPanel
         selectedCount={selectedIds.length}
         item={selectedItem}
+        availableTags={tags}
         onDescriptionChange={handleDescriptionChange}
+        onUpdateItemTags={updateItemTagIds}
         onOpenBookmarkUrl={handleOpenBookmarkUrl}
         onDeleteSelection={() => requestDeleteItems(selectedIds)}
         onMoveSelection={() => requestMoveItems(selectedIds)}
@@ -4752,6 +5104,56 @@ function App() {
                 type="button"
                 className="action-modal-button danger"
                 onClick={handleConfirmDeleteCollection}
+                disabled={isActionInProgress}
+                autoFocus
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteTagConfirm && (
+        <div
+          className="action-modal-backdrop"
+          onClick={() => {
+            if (isActionInProgress) return;
+            setDeleteTagConfirm(null);
+          }}
+          role="presentation"
+        >
+          <div
+            className="action-modal"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete tag confirmation"
+          >
+            <h3 className="action-modal-title">Delete tag?</h3>
+            <p className="action-modal-body">
+              Delete <strong>{deleteTagConfirm.tagName}</strong>
+              {deleteTagConfirm.itemsCount > 0
+                ? ` and remove it from ${deleteTagConfirm.itemsCount} item${
+                    deleteTagConfirm.itemsCount === 1 ? "" : "s"
+                  }?`
+                : "?"}
+            </p>
+            <div className="action-modal-footer">
+              <button
+                type="button"
+                className="action-modal-button"
+                onClick={() => setDeleteTagConfirm(null)}
+                disabled={isActionInProgress}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="action-modal-button danger"
+                onClick={() => {
+                  void handleConfirmDeleteTag();
+                }}
                 disabled={isActionInProgress}
                 autoFocus
               >

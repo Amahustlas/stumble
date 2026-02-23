@@ -1,6 +1,16 @@
+import CloseOutlinedIcon from "@mui/icons-material/CloseOutlined";
+
+type TopbarTagFilter = {
+  id: string;
+  name: string;
+  color: string;
+};
+
 type TopbarProps = {
   searchQuery: string;
   onSearchChange: (value: string) => void;
+  activeTagFilter?: TopbarTagFilter | null;
+  onClearTagFilter?: () => void;
   tileSize: number;
   onTileSizeChange: (value: number) => void;
   onAddUrl: () => void;
@@ -10,13 +20,15 @@ type TopbarProps = {
 function Topbar({
   searchQuery,
   onSearchChange,
+  activeTagFilter = null,
+  onClearTagFilter,
   tileSize,
   onTileSizeChange,
   onAddUrl,
   onImport,
 }: TopbarProps) {
   return (
-    <header className="topbar">
+    <header className={`topbar ${activeTagFilter ? "has-filters" : ""}`}>
       <div className="topbar-search">
         <input
           type="text"
@@ -45,6 +57,28 @@ function Topbar({
           />
         </label>
       </div>
+
+      {activeTagFilter ? (
+        <div className="topbar-filter-row" aria-label="Active filters">
+          <button
+            type="button"
+            className="tag-row active topbar-filter-chip"
+            style={{ "--tag-chip-color": activeTagFilter.color } as React.CSSProperties}
+            onClick={() => onClearTagFilter?.()}
+            title={`Clear tag filter: ${activeTagFilter.name}`}
+          >
+            <span
+              className="tag-row-dot"
+              style={{ backgroundColor: activeTagFilter.color }}
+              aria-hidden="true"
+            />
+            <span className="tag-row-label">{activeTagFilter.name}</span>
+            <span className="topbar-filter-chip-close" aria-hidden="true">
+              <CloseOutlinedIcon fontSize="inherit" />
+            </span>
+          </button>
+        </div>
+      ) : null}
     </header>
   );
 }

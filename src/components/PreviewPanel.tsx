@@ -1,9 +1,13 @@
+import { useEffect, useMemo, useState } from "react";
 import type { Item } from "../App";
+import type { Tag } from "../lib/db";
 
 type PreviewPanelProps = {
   selectedCount: number;
   item: Item | null;
+  availableTags: Tag[];
   onDescriptionChange: (value: string) => void;
+  onUpdateItemTags: (itemId: string, tagIds: string[]) => void | Promise<void>;
   onOpenBookmarkUrl: (url: string) => void | Promise<void>;
   onDeleteSelection: () => void;
   onMoveSelection: () => void;
@@ -23,12 +27,125 @@ function formatPreviewUrlLabel(urlValue: string): string {
 function PreviewPanel({
   selectedCount,
   item,
+  availableTags,
   onDescriptionChange,
+  onUpdateItemTags,
   onOpenBookmarkUrl,
   onDeleteSelection,
   onMoveSelection,
   onDuplicateSelection,
 }: PreviewPanelProps) {
+  const [tagInputValue, setTagInputValue] = useState("");
+  const [activeTagSuggestionIndex, setActiveTagSuggestionIndex] = useState(0);
+  const [isTagInputFocused, setIsTagInputFocused] = useState(false);
+
+  useEffect(() => {
+    setTagInputValue("");
+    setActiveTagSuggestionIndex(0);
+    setIsTagInputFocused(false);
+  }, [item?.id]);
+
+  const tagById = useMemo(() => {
+    const map = new Map<string, Tag>();
+    availableTags.forEach((tag) => {
+      map.set(tag.id, tag);
+    });
+    return map;
+  }, [availableTags]);
+
+  const selectedTagIds = item?.tagIds ?? [];
+  const selectedTagIdSet = useMemo(() => new Set(selectedTagIds), [selectedTagIds]);
+  const selectedTags = useMemo(() => {
+    if (!item) {
+      return [] as Array<{ id: string; name: string; color: string }>;
+    }
+    return item.tagIds.map((tagId, index) => {
+      const tag = tagById.get(tagId);
+      return {
+        id: tagId,
+        name: tag?.name ?? item.tags[index] ?? "Unknown tag",
+        color: tag?.color ?? "#64748b",
+      };
+    });
+  }, [item, tagById]);
+
+  const filteredTagSuggestions = useMemo(() => {
+    const query = tagInputValue.trim().toLowerCase();
+    return availableTags.filter((tag) => {
+      if (selectedTagIdSet.has(tag.id)) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return tag.name.toLowerCase().includes(query);
+    });
+  }, [availableTags, selectedTagIdSet, tagInputValue]);
+
+  useEffect(() => {
+    if (activeTagSuggestionIndex < filteredTagSuggestions.length) {
+      return;
+    }
+    setActiveTagSuggestionIndex(0);
+  }, [activeTagSuggestionIndex, filteredTagSuggestions.length]);
+
+  const applyItemTagIds = (nextTagIds: string[]) => {
+    if (!item) {
+      return;
+    }
+    void onUpdateItemTags(item.id, nextTagIds);
+  };
+
+  const addTagToSelection = (tagId: string) => {
+    if (!item || selectedTagIdSet.has(tagId)) {
+      return;
+    }
+    applyItemTagIds([...item.tagIds, tagId]);
+    setTagInputValue("");
+    setActiveTagSuggestionIndex(0);
+  };
+
+  const removeTagFromSelection = (tagId: string) => {
+    if (!item) {
+      return;
+    }
+    applyItemTagIds(item.tagIds.filter((id) => id !== tagId));
+  };
+
+  const handleTagInputKeyDown: React.KeyboardEventHandler<HTMLInputElement> = (event) => {
+    if (!item) {
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      if (filteredTagSuggestions.length === 0) return;
+      event.preventDefault();
+      setActiveTagSuggestionIndex((current) =>
+        Math.min(current + 1, filteredTagSuggestions.length - 1),
+      );
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      if (filteredTagSuggestions.length === 0) return;
+      event.preventDefault();
+      setActiveTagSuggestionIndex((current) => Math.max(current - 1, 0));
+      return;
+    }
+    if (event.key === "Enter") {
+      const selectedSuggestion =
+        filteredTagSuggestions[activeTagSuggestionIndex] ?? filteredTagSuggestions[0] ?? null;
+      if (!selectedSuggestion) {
+        return;
+      }
+      event.preventDefault();
+      addTagToSelection(selectedSuggestion.id);
+      return;
+    }
+    if (event.key === "Backspace" && tagInputValue.length === 0 && item.tagIds.length > 0) {
+      event.preventDefault();
+      applyItemTagIds(item.tagIds.slice(0, -1));
+    }
+  };
+
   if (selectedCount > 1) {
     return (
       <aside className="preview-panel">
@@ -59,9 +176,9 @@ function PreviewPanel({
   }
 
   const previewSrc = item.type === "image" ? item.previewUrl || "" : "";
-  const bookmarkUrlLabel = item.type === "bookmark" && item.sourceUrl
-    ? formatPreviewUrlLabel(item.sourceUrl)
-    : null;
+  const bookmarkUrlLabel =
+    item.type === "bookmark" && item.sourceUrl ? formatPreviewUrlLabel(item.sourceUrl) : null;
+  const showTagSuggestions = isTagInputFocused && filteredTagSuggestions.length > 0;
 
   return (
     <aside className="preview-panel">
@@ -129,7 +246,74 @@ function PreviewPanel({
         </div>
         <div>
           <dt>Tags</dt>
-          <dd>{item.tags.join(", ") || "-"}</dd>
+          <dd>
+            <div className="preview-tags-editor">
+              <div className="preview-tag-chip-list">
+                {selectedTags.map((tag) => (
+                  <span
+                    key={tag.id}
+                    className="preview-tag-chip"
+                    style={{ "--tag-chip-color": tag.color } as React.CSSProperties}
+                  >
+                    <span
+                      className="preview-tag-chip-dot"
+                      style={{ backgroundColor: tag.color }}
+                      aria-hidden="true"
+                    />
+                    <span className="preview-tag-chip-label">{tag.name}</span>
+                    <button
+                      type="button"
+                      className="preview-tag-chip-remove"
+                      aria-label={`Remove tag ${tag.name}`}
+                      onClick={() => removeTagFromSelection(tag.id)}
+                    >
+                      X
+                    </button>
+                  </span>
+                ))}
+              </div>
+              <div className="preview-tag-input-wrap">
+                <input
+                  type="text"
+                  className="preview-tag-input"
+                  value={tagInputValue}
+                  onChange={(event) => {
+                    setTagInputValue(event.currentTarget.value);
+                    setActiveTagSuggestionIndex(0);
+                  }}
+                  onKeyDown={handleTagInputKeyDown}
+                  onFocus={() => setIsTagInputFocused(true)}
+                  onBlur={() => setIsTagInputFocused(false)}
+                  placeholder="Add tag..."
+                  autoComplete="off"
+                />
+                {showTagSuggestions ? (
+                  <div className="preview-tag-suggestions" role="listbox" aria-label="Tags">
+                    {filteredTagSuggestions.slice(0, 8).map((tag, index) => (
+                      <button
+                        key={tag.id}
+                        type="button"
+                        className={`preview-tag-suggestion ${
+                          index === activeTagSuggestionIndex ? "active" : ""
+                        }`}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          addTagToSelection(tag.id);
+                        }}
+                      >
+                        <span
+                          className="preview-tag-suggestion-dot"
+                          style={{ backgroundColor: tag.color }}
+                          aria-hidden="true"
+                        />
+                        <span>{tag.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </dd>
         </div>
         <div>
           <dt>Collection</dt>
@@ -154,11 +338,7 @@ function PreviewPanel({
         {item.type === "image" && (
           <div>
             <dt>Dimensions</dt>
-            <dd>
-              {item.width && item.height
-                ? `${item.width}x${item.height}`
-                : "unknown"}
-            </dd>
+            <dd>{item.width && item.height ? `${item.width}x${item.height}` : "unknown"}</dd>
           </div>
         )}
       </dl>

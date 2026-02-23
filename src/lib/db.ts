@@ -22,6 +22,15 @@ export interface Collection {
   updatedAt: number;
 };
 
+export interface Tag {
+  id: string;
+  name: string;
+  color: string;
+  sortIndex: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type DbThumbStatus = "ready" | "pending" | "skipped" | "error";
 export type DbImportStatus = "ready" | "processing" | "error";
 export type DbMetaStatus = "ready" | "pending" | "error";
@@ -45,7 +54,17 @@ export type DbItemRecord = {
   description: string | null;
   createdAt: number;
   updatedAt: number;
+  tagIds: string[];
   tags: string[];
+};
+
+export type DbTagRecord = {
+  id: string;
+  name: string;
+  color: string;
+  sortIndex: number;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type DbCollectionItemRecord = {
@@ -61,6 +80,7 @@ export type DbCollectionItemRecord = {
 export type DbAppState = {
   collections: DbCollectionRecord[];
   collectionItems: DbCollectionItemRecord[];
+  tags: DbTagRecord[];
   items: DbItemRecord[];
 };
 
@@ -118,6 +138,12 @@ export type DbReorderCollectionItemsResult = {
   updatedAt: number;
 };
 
+export type DbReorderTagsResult = {
+  updatedRows: number;
+  skippedRows: number;
+  updatedAt: number;
+};
+
 function toCollection(record: DbCollectionRecord): Collection {
   return {
     id: record.id,
@@ -126,6 +152,17 @@ function toCollection(record: DbCollectionRecord): Collection {
     icon: record.icon,
     color: record.color,
     parentId: record.parentId ?? null,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
+function toTag(record: DbTagRecord): Tag {
+  return {
+    id: record.id,
+    name: record.name,
+    color: record.color,
+    sortIndex: record.sortIndex,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
@@ -159,6 +196,50 @@ export async function createCollection(params: {
 export async function getAllCollections(): Promise<Collection[]> {
   const rows = await invoke<DbCollectionRecord[]>("get_all_collections");
   return rows.map(toCollection);
+}
+
+export async function createTag(params: { name: string; color: string }): Promise<Tag> {
+  const row = await invoke<DbTagRecord>("create_tag", {
+    input: {
+      name: params.name,
+      color: params.color,
+    },
+  });
+  return toTag(row);
+}
+
+export async function getAllTags(): Promise<Tag[]> {
+  const rows = await invoke<DbTagRecord[]>("get_all_tags");
+  return rows.map(toTag);
+}
+
+export async function updateTagName(id: string, name: string): Promise<number> {
+  return invoke<number>("update_tag_name", {
+    input: { id, name },
+  });
+}
+
+export async function updateTagColor(id: string, color: string): Promise<number> {
+  return invoke<number>("update_tag_color", {
+    input: { id, color },
+  });
+}
+
+export async function duplicateTag(id: string): Promise<Tag> {
+  const row = await invoke<DbTagRecord>("duplicate_tag", { id });
+  return toTag(row);
+}
+
+export async function deleteTag(id: string): Promise<number> {
+  return invoke<number>("delete_tag", {
+    input: { id },
+  });
+}
+
+export async function reorderTags(tagIds: string[]): Promise<DbReorderTagsResult> {
+  return invoke<DbReorderTagsResult>("reorder_tags", {
+    orderedTagIds: tagIds,
+  });
 }
 
 export async function deleteCollection(id: string): Promise<number> {
@@ -234,6 +315,15 @@ export async function updateDbItemDescription(
   description: string,
 ): Promise<number> {
   return invoke<number>("update_item_description", { itemId, description });
+}
+
+export async function updateDbItemTags(itemId: string, tagIds: string[]): Promise<number> {
+  return invoke<number>("update_item_tags", {
+    input: {
+      itemId,
+      tagIds,
+    },
+  });
 }
 
 export async function updateDbItemMediaState(params: {

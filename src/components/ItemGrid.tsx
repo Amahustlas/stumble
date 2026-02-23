@@ -3,6 +3,8 @@ import LanguageOutlinedIcon from "@mui/icons-material/LanguageOutlined";
 import WarningAmberOutlinedIcon from "@mui/icons-material/WarningAmberOutlined";
 import type { Item } from "../App";
 
+const SIDEBAR_TAG_DRAG_MIME = "application/x-stumble-tag";
+
 type ItemGridProps = {
   items: Item[];
   selectedIds: string[];
@@ -16,6 +18,7 @@ type ItemGridProps = {
   onItemContextMenu: (item: Item, event: React.MouseEvent) => void;
   onImageThumbnailMissing: (item: Item) => void;
   onDropFiles: (files: FileList) => void | Promise<void>;
+  onDropTagOnItem?: (itemId: string, tagId: string) => void | Promise<void>;
 };
 
 function ItemGrid({
@@ -31,13 +34,34 @@ function ItemGrid({
   onItemContextMenu,
   onImageThumbnailMissing,
   onDropFiles,
+  onDropTagOnItem,
 }: ItemGridProps) {
   const [isDragOver, setIsDragOver] = useState(false);
+  const [tagDropTargetItemId, setTagDropTargetItemId] = useState<string | null>(null);
+
+  const getDraggedTagId = (dataTransfer: DataTransfer): string | null => {
+    try {
+      const raw = dataTransfer.getData(SIDEBAR_TAG_DRAG_MIME);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { tagId?: unknown };
+        if (typeof parsed.tagId === "string" && parsed.tagId.trim().length > 0) {
+          return parsed.tagId;
+        }
+      }
+    } catch {
+      // ignore parse failures
+    }
+    return null;
+  };
+
+  const isFileDrag = (dataTransfer: DataTransfer): boolean =>
+    Array.from(dataTransfer.types ?? []).includes("Files");
 
   const handleDrop: React.DragEventHandler<HTMLElement> = (event) => {
     event.preventDefault();
     event.stopPropagation();
     setIsDragOver(false);
+    setTagDropTargetItemId(null);
     if (event.dataTransfer.files.length > 0) {
       void onDropFiles(event.dataTransfer.files);
     }
@@ -60,11 +84,17 @@ function ItemGrid({
       className={`item-grid-wrap ${isDragOver ? "drag-over" : ""}`}
       onClick={handleWrapClick}
       onDragOver={(event) => {
+        if (!isFileDrag(event.dataTransfer)) {
+          return;
+        }
         event.preventDefault();
         event.stopPropagation();
         setIsDragOver(true);
       }}
       onDragLeave={(event) => {
+        if (!isFileDrag(event.dataTransfer)) {
+          return;
+        }
         event.preventDefault();
         setIsDragOver(false);
       }}
@@ -73,6 +103,46 @@ function ItemGrid({
       <section
         className="item-grid"
         style={{ "--tile-size": `${tileSize}px` } as React.CSSProperties}
+        onDragOverCapture={(event) => {
+          const draggedTagId = getDraggedTagId(event.dataTransfer);
+          if (!draggedTagId) {
+            return;
+          }
+          const targetElement =
+            event.target instanceof Element
+              ? event.target.closest<HTMLElement>("[data-item-id]")
+              : null;
+          event.preventDefault();
+          event.stopPropagation();
+          event.dataTransfer.dropEffect = "copy";
+          const targetItemId = targetElement?.dataset.itemId ?? null;
+          setTagDropTargetItemId((current) => (current === targetItemId ? current : targetItemId));
+        }}
+        onDropCapture={(event) => {
+          const draggedTagId = getDraggedTagId(event.dataTransfer);
+          if (!draggedTagId) {
+            return;
+          }
+          const targetElement =
+            event.target instanceof Element
+              ? event.target.closest<HTMLElement>("[data-item-id]")
+              : null;
+          event.preventDefault();
+          event.stopPropagation();
+          const targetItemId = targetElement?.dataset.itemId ?? null;
+          setTagDropTargetItemId(null);
+          if (!targetItemId) {
+            return;
+          }
+          void onDropTagOnItem?.(targetItemId, draggedTagId);
+        }}
+        onDragLeaveCapture={(event) => {
+          const relatedTarget = event.relatedTarget;
+          if (relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget)) {
+            return;
+          }
+          setTagDropTargetItemId(null);
+        }}
       >
         {items.map((item) => {
           const isImporting = item.importStatus === "processing";
@@ -106,7 +176,7 @@ function ItemGrid({
                 reorderDropTargetItemId === item.id && reorderDropPosition
                   ? `reorder-target reorder-target-${reorderDropPosition}`
                   : ""
-              }`}
+              } ${tagDropTargetItemId === item.id ? "item-card-tag-drop-target" : ""}`}
               onClick={(event) => onSelectItem(item.id, event)}
               onDoubleClick={() => onItemDoubleClick(item)}
               onContextMenu={(event) => onItemContextMenu(item, event)}
@@ -116,6 +186,33 @@ function ItemGrid({
               }}
               onDragStart={(event) => {
                 event.preventDefault();
+              }}
+              onDragOverCapture={(event) => {
+                const draggedTagId = getDraggedTagId(event.dataTransfer);
+                if (!draggedTagId) {
+                  return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                event.dataTransfer.dropEffect = "copy";
+                setTagDropTargetItemId((current) => (current === item.id ? current : item.id));
+              }}
+              onDragLeaveCapture={(event) => {
+                const relatedTarget = event.relatedTarget;
+                if (relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget)) {
+                  return;
+                }
+                setTagDropTargetItemId((current) => (current === item.id ? null : current));
+              }}
+              onDropCapture={(event) => {
+                const draggedTagId = getDraggedTagId(event.dataTransfer);
+                if (!draggedTagId) {
+                  return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                setTagDropTargetItemId(null);
+                void onDropTagOnItem?.(item.id, draggedTagId);
               }}
             >
               <div className={getThumbnailClass(item.type)}>

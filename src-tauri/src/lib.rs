@@ -30,6 +30,7 @@ const DEFAULT_ROOT_COLLECTION_ID: &str = "root";
 const DEFAULT_ROOT_COLLECTION_NAME: &str = "Root";
 const DEFAULT_ROOT_COLLECTION_ICON: &str = "folder";
 const DEFAULT_ROOT_COLLECTION_COLOR: &str = "#60a5fa";
+const DEFAULT_TAG_COLOR: &str = "#64748b";
 const DEFAULT_THUMB_STATUS: &str = "pending";
 const DEFAULT_IMPORT_STATUS: &str = "ready";
 const DEFAULT_META_STATUS: &str = "ready";
@@ -77,7 +78,19 @@ struct DbItemRow {
     description: Option<String>,
     created_at: i64,
     updated_at: i64,
+    tag_ids: Vec<String>,
     tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DbTagRow {
+    id: String,
+    name: String,
+    color: String,
+    sort_index: i64,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Serialize)]
@@ -97,6 +110,7 @@ struct DbCollectionItemRow {
 struct DbAppState {
     collections: Vec<DbCollectionRow>,
     collection_items: Vec<DbCollectionItemRow>,
+    tags: Vec<DbTagRow>,
     items: Vec<DbItemRow>,
 }
 
@@ -163,6 +177,40 @@ struct UpdateItemBookmarkMetadataInput {
     filename: Option<String>,
     favicon_path: Option<String>,
     meta_status: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateTagInput {
+    name: String,
+    color: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTagNameInput {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTagColorInput {
+    id: String,
+    color: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteTagInput {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateItemTagsInput {
+    item_id: String,
+    tag_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -336,7 +384,11 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
 
             CREATE TABLE IF NOT EXISTS tags (
                 id TEXT PRIMARY KEY,
-                name TEXT UNIQUE NOT NULL
+                name TEXT UNIQUE NOT NULL,
+                color TEXT NOT NULL DEFAULT '#64748b',
+                sort_index INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS item_tags (
@@ -366,6 +418,7 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
     ensure_items_bookmark_columns(connection)?;
     ensure_collections_columns(connection)?;
     ensure_collection_items_columns(connection)?;
+    ensure_tags_columns(connection)?;
     ensure_collection_items_indexes(connection)?;
     backfill_collection_items_from_items(connection)?;
     sync_legacy_item_collection_ids(connection)?;
@@ -608,6 +661,109 @@ fn ensure_collection_items_columns(connection: &Connection) -> Result<(), String
             })?;
     }
 
+    Ok(())
+}
+
+fn ensure_tags_columns(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare("PRAGMA table_info(tags)")
+        .map_err(|err| format!("failed to inspect tags table info: {}", err))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to read tags table info: {}", err))?;
+
+    let mut has_color = false;
+    let mut has_sort_index = false;
+    let mut has_created_at = false;
+    let mut has_updated_at = false;
+    for row_result in rows {
+        let column_name =
+            row_result.map_err(|err| format!("failed to parse tags table column: {}", err))?;
+        if column_name == "color" {
+            has_color = true;
+        }
+        if column_name == "sort_index" {
+            has_sort_index = true;
+        }
+        if column_name == "created_at" {
+            has_created_at = true;
+        }
+        if column_name == "updated_at" {
+            has_updated_at = true;
+        }
+    }
+
+    if !has_color {
+        connection
+            .execute(
+                "ALTER TABLE tags ADD COLUMN color TEXT NOT NULL DEFAULT '#64748b'",
+                [],
+            )
+            .map_err(|err| format!("failed to add tags.color column: {}", err))?;
+    }
+
+    if !has_created_at {
+        connection
+            .execute(
+                "ALTER TABLE tags ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|err| format!("failed to add tags.created_at column: {}", err))?;
+    }
+
+    if !has_updated_at {
+        connection
+            .execute(
+                "ALTER TABLE tags ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|err| format!("failed to add tags.updated_at column: {}", err))?;
+    }
+
+    if !has_sort_index {
+        connection
+            .execute(
+                "ALTER TABLE tags ADD COLUMN sort_index INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|err| format!("failed to add tags.sort_index column: {}", err))?;
+    }
+
+    let now = Utc::now().timestamp_millis();
+    connection
+        .execute(
+            "UPDATE tags
+             SET color = COALESCE(NULLIF(TRIM(color), ''), ?1)
+             WHERE color IS NULL OR TRIM(color) = ''",
+            params![DEFAULT_TAG_COLOR],
+        )
+        .map_err(|err| format!("failed to backfill tags.color values: {}", err))?;
+    connection
+        .execute(
+            "UPDATE tags
+             SET created_at = ?1
+             WHERE created_at = 0",
+            params![now],
+        )
+        .map_err(|err| format!("failed to backfill tags.created_at values: {}", err))?;
+    connection
+        .execute(
+            "UPDATE tags
+             SET updated_at = created_at
+             WHERE updated_at = 0",
+            [],
+        )
+        .map_err(|err| format!("failed to backfill tags.updated_at values: {}", err))?;
+    if !has_sort_index {
+        connection
+            .execute(
+                "UPDATE tags
+                 SET sort_index = created_at
+                 WHERE sort_index = 0",
+                [],
+            )
+            .map_err(|err| format!("failed to backfill tags.sort_index values: {}", err))?;
+    }
     Ok(())
 }
 
@@ -1214,6 +1370,123 @@ fn normalize_optional_trimmed_string(value: Option<String>) -> Option<String> {
 
 fn collapse_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_tag_name(raw: &str) -> Result<String, String> {
+    let normalized = collapse_whitespace(raw.trim());
+    if normalized.is_empty() {
+        return Err("tag name cannot be empty".to_string());
+    }
+    Ok(normalized)
+}
+
+fn normalize_tag_color(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().to_string();
+    if normalized.is_empty() {
+        return Err("tag color cannot be empty".to_string());
+    }
+    Ok(normalized)
+}
+
+fn db_tag_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbTagRow> {
+    Ok(DbTagRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        color: row.get(2)?,
+        sort_index: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn find_tag_row_by_name_in_tx(
+    transaction: &Transaction<'_>,
+    tag_name: &str,
+) -> Result<Option<DbTagRow>, String> {
+    transaction
+        .query_row(
+            "SELECT id, name, color, sort_index, created_at, updated_at
+             FROM tags
+             WHERE name = ?1
+             LIMIT 1",
+            params![tag_name],
+            db_tag_row_from_row,
+        )
+        .optional()
+        .map_err(|err| format!("failed to query tag by name: {}", err))
+}
+
+fn next_tag_sort_index_in_tx(transaction: &Transaction<'_>) -> Result<i64, String> {
+    transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sort_index), -1) + 1 FROM tags",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|err| format!("failed to resolve next tag sort index: {}", err))
+}
+
+fn insert_tag_row_in_tx(
+    transaction: &Transaction<'_>,
+    name: &str,
+    color: &str,
+    now: i64,
+) -> Result<DbTagRow, String> {
+    let tag_id = Uuid::new_v4().to_string();
+    let sort_index = next_tag_sort_index_in_tx(transaction)?;
+    transaction
+        .execute(
+            "INSERT INTO tags (id, name, color, sort_index, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![&tag_id, name, color, sort_index, now],
+        )
+        .map_err(|err| format!("failed to insert tag row: {}", err))?;
+    Ok(DbTagRow {
+        id: tag_id,
+        name: name.to_string(),
+        color: color.to_string(),
+        sort_index,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn ensure_tag_exists_by_name_in_tx(
+    transaction: &Transaction<'_>,
+    tag_name: &str,
+    now: i64,
+) -> Result<String, String> {
+    if let Some(existing) = find_tag_row_by_name_in_tx(transaction, tag_name)? {
+        return Ok(existing.id);
+    }
+    let created = insert_tag_row_in_tx(transaction, tag_name, DEFAULT_TAG_COLOR, now)?;
+    Ok(created.id)
+}
+
+fn next_duplicate_tag_name(connection: &Connection, source_name: &str) -> Result<String, String> {
+    let base = format!("{} copy", source_name.trim());
+    let base = collapse_whitespace(&base);
+    if base.is_empty() {
+        return Err("tag name cannot be empty".to_string());
+    }
+
+    let mut candidate = base.clone();
+    let mut suffix = 2usize;
+    loop {
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM tags WHERE name = ?1 LIMIT 1",
+                params![&candidate],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to check duplicate tag name: {}", err))?;
+        if exists.is_none() {
+            return Ok(candidate);
+        }
+        candidate = format!("{} {}", base, suffix);
+        suffix += 1;
+    }
 }
 
 fn build_bookmark_http_client() -> Result<reqwest::Client, String> {
@@ -2056,6 +2329,29 @@ fn load_app_state() -> Result<DbAppState, String> {
         );
     }
 
+    let mut tags_stmt = connection
+        .prepare(
+            "SELECT
+                id,
+                name,
+                color,
+                sort_index,
+                created_at,
+                updated_at
+             FROM tags
+             ORDER BY sort_index ASC, created_at ASC, LOWER(name) ASC, name ASC",
+        )
+        .map_err(|err| format!("failed to prepare tags query: {}", err))?;
+
+    let tags_iter = tags_stmt
+        .query_map([], db_tag_row_from_row)
+        .map_err(|err| format!("failed to query tags: {}", err))?;
+
+    let mut tags = Vec::new();
+    for row_result in tags_iter {
+        tags.push(row_result.map_err(|err| format!("failed to read tag row: {}", err))?);
+    }
+
     let mut items_stmt = connection
         .prepare(
             "SELECT
@@ -2077,6 +2373,7 @@ fn load_app_state() -> Result<DbAppState, String> {
                 i.description,
                 i.created_at,
                 i.updated_at,
+                COALESCE(GROUP_CONCAT(it.tag_id, '|'), ''),
                 COALESCE(GROUP_CONCAT(t.name, '|'), '')
              FROM items AS i
              LEFT JOIN item_tags AS it ON it.item_id = i.id
@@ -2088,7 +2385,13 @@ fn load_app_state() -> Result<DbAppState, String> {
 
     let items_iter = items_stmt
         .query_map([], |row| {
-            let tag_names: String = row.get(18)?;
+            let tag_ids_raw: String = row.get(18)?;
+            let tag_names: String = row.get(19)?;
+            let tag_ids = if tag_ids_raw.is_empty() {
+                Vec::new()
+            } else {
+                tag_ids_raw.split('|').map(str::to_string).collect()
+            };
             let tags = if tag_names.is_empty() {
                 Vec::new()
             } else {
@@ -2114,6 +2417,7 @@ fn load_app_state() -> Result<DbAppState, String> {
                 description: row.get(15)?,
                 created_at: row.get(16)?,
                 updated_at: row.get(17)?,
+                tag_ids,
                 tags,
             })
         })
@@ -2127,6 +2431,7 @@ fn load_app_state() -> Result<DbAppState, String> {
     Ok(DbAppState {
         collections,
         collection_items,
+        tags,
         items,
     })
 }
@@ -2435,6 +2740,276 @@ fn delete_collection(id: String) -> Result<usize, String> {
     Ok(deleted_rows)
 }
 
+#[tauri::command]
+fn create_tag(input: CreateTagInput) -> Result<DbTagRow, String> {
+    initialize_db()?;
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+
+    let normalized_name = normalize_tag_name(&input.name)?;
+    let normalized_color = normalize_tag_color(&input.color)?;
+    let now = Utc::now().timestamp_millis();
+
+    if find_tag_row_by_name_in_tx(&transaction, &normalized_name)?.is_some() {
+        return Err("tag name already exists".to_string());
+    }
+
+    let created = insert_tag_row_in_tx(&transaction, &normalized_name, &normalized_color, now)?;
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit create tag transaction: {}", err))?;
+    Ok(created)
+}
+
+#[tauri::command]
+fn get_all_tags() -> Result<Vec<DbTagRow>, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+    let mut stmt = connection
+        .prepare(
+            "SELECT id, name, color, sort_index, created_at, updated_at
+             FROM tags
+             ORDER BY sort_index ASC, created_at ASC, LOWER(name) ASC, name ASC",
+        )
+        .map_err(|err| format!("failed to prepare all tags query: {}", err))?;
+    let row_iter = stmt
+        .query_map([], db_tag_row_from_row)
+        .map_err(|err| format!("failed to query all tags: {}", err))?;
+    let mut tags = Vec::new();
+    for row_result in row_iter {
+        tags.push(row_result.map_err(|err| format!("failed to read tag row: {}", err))?);
+    }
+    Ok(tags)
+}
+
+#[tauri::command]
+fn reorder_tags(ordered_tag_ids: Vec<String>) -> Result<UpdateCollectionOrderResult, String> {
+    let normalized_tag_ids = normalize_item_ids_input(ordered_tag_ids);
+    let updated_at = Utc::now().timestamp_millis();
+
+    if normalized_tag_ids.is_empty() {
+        return Ok(UpdateCollectionOrderResult {
+            updated_rows: 0,
+            skipped_rows: 0,
+            updated_at,
+        });
+    }
+
+    initialize_db()?;
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+
+    let mut updated_rows = 0usize;
+    let mut skipped_rows = 0usize;
+    for (index, tag_id) in normalized_tag_ids.iter().enumerate() {
+        let affected = transaction
+            .execute(
+                "UPDATE tags
+                 SET sort_index = ?1,
+                     updated_at = ?2
+                 WHERE id = ?3",
+                params![index as i64, updated_at, tag_id],
+            )
+            .map_err(|err| format!("failed to reorder tag row: {}", err))?;
+        if affected == 0 {
+            skipped_rows += 1;
+        } else {
+            updated_rows += affected;
+        }
+    }
+
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit reorder tags transaction: {}", err))?;
+
+    Ok(UpdateCollectionOrderResult {
+        updated_rows,
+        skipped_rows,
+        updated_at,
+    })
+}
+
+#[tauri::command]
+fn update_tag_name(input: UpdateTagNameInput) -> Result<i64, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+    let tag_id = normalize_trimmed_id(&input.id).ok_or_else(|| "tag id cannot be empty".to_string())?;
+    let normalized_name = normalize_tag_name(&input.name)?;
+    let updated_at = Utc::now().timestamp_millis();
+
+    let updated_rows = connection
+        .execute(
+            "UPDATE tags
+             SET name = ?1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![normalized_name, updated_at, tag_id],
+        )
+        .map_err(|err| format!("failed to update tag name: {}", err))?;
+    if updated_rows == 0 {
+        return Err("tag not found while updating name".to_string());
+    }
+    Ok(updated_at)
+}
+
+#[tauri::command]
+fn update_tag_color(input: UpdateTagColorInput) -> Result<i64, String> {
+    initialize_db()?;
+    let connection = open_db_connection()?;
+    let tag_id = normalize_trimmed_id(&input.id).ok_or_else(|| "tag id cannot be empty".to_string())?;
+    let normalized_color = normalize_tag_color(&input.color)?;
+    let updated_at = Utc::now().timestamp_millis();
+
+    let updated_rows = connection
+        .execute(
+            "UPDATE tags
+             SET color = ?1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![normalized_color, updated_at, tag_id],
+        )
+        .map_err(|err| format!("failed to update tag color: {}", err))?;
+    if updated_rows == 0 {
+        return Err("tag not found while updating color".to_string());
+    }
+    Ok(updated_at)
+}
+
+#[tauri::command]
+fn duplicate_tag(id: String) -> Result<DbTagRow, String> {
+    initialize_db()?;
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+    let tag_id = normalize_trimmed_id(&id).ok_or_else(|| "tag id cannot be empty".to_string())?;
+
+    let source = transaction
+        .query_row(
+            "SELECT id, name, color, sort_index, created_at, updated_at
+             FROM tags
+             WHERE id = ?1",
+            params![&tag_id],
+            db_tag_row_from_row,
+        )
+        .optional()
+        .map_err(|err| format!("failed to load tag for duplicate: {}", err))?
+        .ok_or_else(|| "tag not found while duplicating".to_string())?;
+
+    let duplicate_name = next_duplicate_tag_name(&transaction, &source.name)?;
+    let now = Utc::now().timestamp_millis();
+    let duplicated = insert_tag_row_in_tx(&transaction, &duplicate_name, &source.color, now)?;
+
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit duplicate tag transaction: {}", err))?;
+    Ok(duplicated)
+}
+
+#[tauri::command]
+fn delete_tag(input: DeleteTagInput) -> Result<usize, String> {
+    initialize_db()?;
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+    let tag_id = normalize_trimmed_id(&input.id).ok_or_else(|| "tag id cannot be empty".to_string())?;
+    let updated_at = Utc::now().timestamp_millis();
+
+    transaction
+        .execute(
+            "UPDATE items
+             SET updated_at = ?1
+             WHERE id IN (
+               SELECT DISTINCT item_id FROM item_tags WHERE tag_id = ?2
+             )",
+            params![updated_at, &tag_id],
+        )
+        .map_err(|err| format!("failed to update item timestamps for tag delete: {}", err))?;
+
+    let deleted_rows = transaction
+        .execute("DELETE FROM tags WHERE id = ?1", params![&tag_id])
+        .map_err(|err| format!("failed to delete tag: {}", err))?;
+
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit delete tag transaction: {}", err))?;
+    Ok(deleted_rows)
+}
+
+#[tauri::command]
+fn update_item_tags(input: UpdateItemTagsInput) -> Result<i64, String> {
+    initialize_db()?;
+    let mut connection = open_db_connection()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|err| format!("failed to start sqlite transaction: {}", err))?;
+
+    let item_id = normalize_trimmed_id(&input.item_id).ok_or_else(|| "item id cannot be empty".to_string())?;
+    let tag_ids = normalize_item_ids_input(input.tag_ids);
+    let updated_at = Utc::now().timestamp_millis();
+
+    let item_exists = transaction
+        .query_row(
+            "SELECT 1 FROM items WHERE id = ?1",
+            params![&item_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|err| format!("failed to validate item for tag update: {}", err))?;
+    if item_exists.is_none() {
+        return Err("item not found while updating tags".to_string());
+    }
+
+    for tag_id in &tag_ids {
+        let tag_exists = transaction
+            .query_row(
+                "SELECT 1 FROM tags WHERE id = ?1",
+                params![tag_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to validate tag for item tag update: {}", err))?;
+        if tag_exists.is_none() {
+            return Err(format!("tag not found while assigning to item: {}", tag_id));
+        }
+    }
+
+    transaction
+        .execute("DELETE FROM item_tags WHERE item_id = ?1", params![&item_id])
+        .map_err(|err| format!("failed to clear item tag mappings: {}", err))?;
+
+    for tag_id in &tag_ids {
+        transaction
+            .execute(
+                "INSERT INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
+                params![&item_id, tag_id],
+            )
+            .map_err(|err| format!("failed to insert item tag mapping: {}", err))?;
+    }
+
+    let updated_rows = transaction
+        .execute(
+            "UPDATE items
+             SET updated_at = ?1
+             WHERE id = ?2",
+            params![updated_at, &item_id],
+        )
+        .map_err(|err| format!("failed to update item timestamp for tag update: {}", err))?;
+    if updated_rows == 0 {
+        return Err("item not found while finalizing tag update".to_string());
+    }
+
+    transaction
+        .commit()
+        .map_err(|err| format!("failed to commit update item tags transaction: {}", err))?;
+    Ok(updated_at)
+}
+
 fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Result<(), String> {
     let InsertItemInput {
         id,
@@ -2458,6 +3033,7 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
         tags,
     } = item;
     let collection_id_for_membership = collection_id.clone();
+    let tag_timestamp = Utc::now().timestamp_millis();
 
     transaction
         .execute(
@@ -2528,28 +3104,14 @@ fn insert_item_in_tx(transaction: &Transaction<'_>, item: InsertItemInput) -> Re
     }
 
     for tag_name in unique_tags {
-        let tag_id = tag_name.to_ascii_lowercase();
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO tags (id, name) VALUES (?1, ?2)",
-                params![tag_id, tag_name],
-            )
-            .map_err(|err| format!("failed to upsert tag row: {}", err))?;
-
+        let tag_id = ensure_tag_exists_by_name_in_tx(transaction, &tag_name, tag_timestamp)?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
-                params![&id, tag_id],
+                params![&id, &tag_id],
             )
             .map_err(|err| format!("failed to map item tag row: {}", err))?;
     }
-
-    transaction
-        .execute(
-            "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM item_tags)",
-            [],
-        )
-        .map_err(|err| format!("failed to prune unused tags: {}", err))?;
 
     Ok(())
 }
@@ -2649,13 +3211,6 @@ fn delete_items_with_cleanup_internal(item_ids: Vec<String>) -> Result<DeleteIte
             .map_err(|err| format!("failed to delete item row: {}", err))?;
         deleted_rows += affected;
     }
-
-    transaction
-        .execute(
-            "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM item_tags)",
-            [],
-        )
-        .map_err(|err| format!("failed to prune unused tags: {}", err))?;
 
     let mut zero_ref_candidates: Vec<(String, String, String, String)> = Vec::new();
     for (vault_key, decrement_by) in vault_counts_by_key {
@@ -3723,6 +4278,13 @@ pub fn run() {
             get_all_collections,
             update_collection_name,
             delete_collection,
+            create_tag,
+            get_all_tags,
+            reorder_tags,
+            update_tag_name,
+            update_tag_color,
+            duplicate_tag,
+            delete_tag,
             insert_item,
             insert_items_batch,
             delete_items,
@@ -3731,6 +4293,7 @@ pub fn run() {
             add_items_to_collection,
             reorder_collection_items,
             update_items_collection,
+            update_item_tags,
             update_item_description,
             update_item_bookmark_metadata,
             update_item_media_state,

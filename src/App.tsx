@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  startTransition,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -7,7 +15,7 @@ import ContextMenu, { type ContextMenuAction } from "./components/ContextMenu";
 import ItemGrid from "./components/ItemGrid";
 import PreviewPanel from "./components/PreviewPanel";
 import Sidebar from "./components/Sidebar";
-import Topbar, { type TopbarSortOption } from "./components/Topbar";
+import Topbar, { type TopbarFilterChip, type TopbarSortOption } from "./components/Topbar";
 import {
   initDb,
   loadDbAppState,
@@ -70,6 +78,15 @@ import {
   collectCollectionSubtreeIds,
   type CollectionTreeNode,
 } from "./lib/collections";
+import {
+  createDefaultAdvancedItemFilters,
+  filterItems,
+  formatAdvancedItemFilterTypeLabel,
+  hasActiveAdvancedItemFilters,
+  normalizeAdvancedItemFilters,
+  type AdvancedItemFilterType,
+  type AdvancedItemFilters,
+} from "./lib/itemFilters";
 
 export type ItemType = "bookmark" | "image" | "video" | "pdf" | "file" | "note";
 export type ThumbStatus = "ready" | "pending" | "skipped" | "error";
@@ -536,6 +553,7 @@ const DEFAULT_LEFT_PANEL_WIDTH = 260;
 const DEFAULT_RIGHT_PANEL_WIDTH = 320;
 const LEFT_PANEL_WIDTH_STORAGE_KEY = "stumble:left-panel-width";
 const RIGHT_PANEL_WIDTH_STORAGE_KEY = "stumble:right-panel-width";
+const LIST_VIEW_CONTROLS_STORAGE_KEY = "stumble:list-view-controls";
 const DEFAULT_COLLECTION_ICON = "folder";
 const DEFAULT_COLLECTION_COLOR = "#8B8B8B";
 const DEFAULT_COLLECTION_NAME = "New Collection";
@@ -553,6 +571,12 @@ const TAG_COLOR_PALETTE = [
   "#3b82f6",
   "#a855f7",
 ] as const;
+
+type PersistedListViewControls = {
+  searchQuery: string;
+  sortOption: TopbarSortOption;
+  advancedFilters: AdvancedItemFilters;
+};
 
 function nextCollectionName(collections: Collection[]): string {
   const normalizedNames = new Set(
@@ -679,6 +703,37 @@ function readPersistedPanelWidth(args: {
   }
 }
 
+function isTopbarSortOption(value: unknown): value is TopbarSortOption {
+  return value === "newest" || value === "oldest" || value === "name-asc" || value === "rating-desc";
+}
+
+function readPersistedListViewControls(): PersistedListViewControls {
+  const fallback: PersistedListViewControls = {
+    searchQuery: "",
+    sortOption: "newest",
+    advancedFilters: createDefaultAdvancedItemFilters(),
+  };
+
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(LIST_VIEW_CONTROLS_STORAGE_KEY);
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw) as Partial<Record<keyof PersistedListViewControls, unknown>>;
+    return {
+      searchQuery: typeof parsed.searchQuery === "string" ? parsed.searchQuery : fallback.searchQuery,
+      sortOption: isTopbarSortOption(parsed.sortOption) ? parsed.sortOption : fallback.sortOption,
+      advancedFilters: normalizeAdvancedItemFilters(parsed.advancedFilters),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 function normalizeDate(dateValue: string): string {
   const parsed = new Date(dateValue);
   if (Number.isNaN(parsed.getTime())) {
@@ -772,44 +827,6 @@ function normalizeItemRating(value: number | null | undefined): number {
     return 0;
   }
   return Math.max(0, Math.min(5, Math.round(value)));
-}
-
-function dateSortValue(value: string): number {
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function compareItemsBySortOption(left: Item, right: Item, sortOption: TopbarSortOption): number {
-  if (sortOption === "name-asc") {
-    const nameCompare = left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
-    if (nameCompare !== 0) {
-      return nameCompare;
-    }
-    return right.id.localeCompare(left.id);
-  }
-
-  if (sortOption === "rating-desc") {
-    const leftRating = normalizeItemRating(left.rating);
-    const rightRating = normalizeItemRating(right.rating);
-    if (leftRating !== rightRating) {
-      return rightRating - leftRating;
-    }
-    const createdDelta = dateSortValue(right.createdAt) - dateSortValue(left.createdAt);
-    if (createdDelta !== 0) {
-      return createdDelta;
-    }
-    return left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
-  }
-
-  const leftCreatedAt = dateSortValue(left.createdAt);
-  const rightCreatedAt = dateSortValue(right.createdAt);
-  if (leftCreatedAt !== rightCreatedAt) {
-    return sortOption === "oldest"
-      ? leftCreatedAt - rightCreatedAt
-      : rightCreatedAt - leftCreatedAt;
-  }
-
-  return left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
 }
 
 function shouldSkipThumbnailGeneration(args: {
@@ -1264,12 +1281,22 @@ function mapDbItemToItem(args: {
 }
 
 function App() {
+  const initialListViewControlsRef = useRef<PersistedListViewControls | null>(null);
+  if (initialListViewControlsRef.current === null) {
+    initialListViewControlsRef.current = readPersistedListViewControls();
+  }
+  const initialListViewControls = initialListViewControlsRef.current;
+
   const [collections, setCollections] = useState<Collection[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
   const [items, setItems] = useState<Item[]>(initialItems);
-  const [searchQuery, setSearchQuery] = useState("");
+  const [searchQuery, setSearchQuery] = useState(initialListViewControls.searchQuery);
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState(initialListViewControls.searchQuery);
   const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>("all");
-  const [sortOption, setSortOption] = useState<TopbarSortOption>("newest");
+  const [sortOption, setSortOption] = useState<TopbarSortOption>(initialListViewControls.sortOption);
+  const [advancedFilters, setAdvancedFilters] = useState<AdvancedItemFilters>(
+    initialListViewControls.advancedFilters,
+  );
   const [tileSize, setTileSize] = useState(220);
   const [nativeDropEnabled, setNativeDropEnabled] = useState(false);
   const [imageModalOpen, setImageModalOpen] = useState(false);
@@ -1360,6 +1387,7 @@ function App() {
   } | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [selectionAnchorId, setSelectionAnchorId] = useState<string | null>(null);
+  const deferredSearchQuery = useDeferredValue(debouncedSearchQuery);
 
   const collectionTree = useMemo(() => buildCollectionTree(collections), [collections]);
   const collectionPathById = useMemo(
@@ -1379,6 +1407,120 @@ function App() {
       ? collectionPathById.get(selectedCollectionId) ?? "All Items"
       : "All Items";
   const activeTagFilter = selectedTagId ? tagById.get(selectedTagId) ?? null : null;
+  const hasActiveGridSubsetFilter =
+    libraryViewMode === "favorites" ||
+    selectedTagId !== null ||
+    searchQuery.trim().length > 0 ||
+    hasActiveAdvancedItemFilters(advancedFilters);
+
+  const activeTopbarFilterChips = useMemo<TopbarFilterChip[]>(() => {
+    const chips: TopbarFilterChip[] = [];
+
+    if (activeTagFilter) {
+      chips.push({
+        id: `sidebar-tag:${activeTagFilter.id}`,
+        label: `#${activeTagFilter.name}`,
+        color: activeTagFilter.color,
+        title: `Clear sidebar tag filter: ${activeTagFilter.name}`,
+      });
+    }
+
+    advancedFilters.tagIds.forEach((tagId) => {
+      const tag = tagById.get(tagId);
+      chips.push({
+        id: `tag:${tagId}`,
+        label: `#${tag?.name ?? tagId}`,
+        ...(tag?.color ? { color: tag.color } : {}),
+        title: tag ? `Remove tag filter: ${tag.name}` : "Remove tag filter",
+      });
+    });
+
+    advancedFilters.types.forEach((typeValue) => {
+      chips.push({
+        id: `type:${typeValue}`,
+        label: formatAdvancedItemFilterTypeLabel(typeValue),
+      });
+    });
+
+    if (advancedFilters.minRating > 0) {
+      chips.push({
+        id: "rating",
+        label: `Rating >= ${advancedFilters.minRating}`,
+      });
+    }
+
+    if (advancedFilters.favoritesOnly) {
+      chips.push({
+        id: "favorites",
+        label: "Favorites",
+      });
+    }
+
+    return chips;
+  }, [activeTagFilter, advancedFilters, tagById]);
+
+  const handleRemoveTopbarFilterChip = useCallback((chipId: string) => {
+    if (chipId.startsWith("sidebar-tag:")) {
+      setSelectedTagId(null);
+      return;
+    }
+
+    if (chipId.startsWith("tag:")) {
+      const tagId = chipId.slice("tag:".length);
+      setAdvancedFilters((current) => {
+        if (!current.tagIds.includes(tagId)) {
+          return current;
+        }
+        return {
+          ...current,
+          tagIds: current.tagIds.filter((entry) => entry !== tagId),
+        };
+      });
+      return;
+    }
+
+    if (chipId.startsWith("type:")) {
+      const typeValue = chipId.slice("type:".length) as AdvancedItemFilterType;
+      setAdvancedFilters((current) => {
+        if (!current.types.includes(typeValue)) {
+          return current;
+        }
+        return {
+          ...current,
+          types: current.types.filter((entry) => entry !== typeValue),
+        };
+      });
+      return;
+    }
+
+    if (chipId === "rating") {
+      setAdvancedFilters((current) =>
+        current.minRating === 0
+          ? current
+          : {
+              ...current,
+              minRating: 0,
+            },
+      );
+      return;
+    }
+
+    if (chipId === "favorites") {
+      setAdvancedFilters((current) =>
+        !current.favoritesOnly
+          ? current
+          : {
+              ...current,
+              favoritesOnly: false,
+            },
+      );
+    }
+  }, []);
+
+  const handleClearAllTopbarFilters = useCallback(() => {
+    setSelectedTagId(null);
+    setAdvancedFilters(createDefaultAdvancedItemFilters());
+  }, []);
 
   const handleSidebarSelectCollection = useCallback((collectionId: string | null) => {
     if (collectionId !== null) {
@@ -1421,10 +1563,52 @@ function App() {
   );
 
   useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      startTransition(() => {
+        setDebouncedSearchQuery(searchQuery);
+      });
+    }, 300);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [searchQuery]);
+
+  useEffect(() => {
     if (selectedTagId && !tags.some((tag) => tag.id === selectedTagId)) {
       setSelectedTagId(null);
     }
   }, [tags, selectedTagId]);
+
+  useEffect(() => {
+    const validTagIds = new Set(tags.map((tag) => tag.id));
+    setAdvancedFilters((current) => {
+      if (current.tagIds.length === 0) {
+        return current;
+      }
+      const nextTagIds = current.tagIds.filter((tagId) => validTagIds.has(tagId));
+      if (nextTagIds.length === current.tagIds.length) {
+        return current;
+      }
+      return {
+        ...current,
+        tagIds: nextTagIds,
+      };
+    });
+  }, [tags]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        LIST_VIEW_CONTROLS_STORAGE_KEY,
+        JSON.stringify({
+          searchQuery,
+          sortOption,
+          advancedFilters,
+        } satisfies PersistedListViewControls),
+      );
+    } catch {
+      // ignore localStorage write errors
+    }
+  }, [advancedFilters, searchQuery, sortOption]);
 
   useEffect(() => {
     try {
@@ -4096,27 +4280,13 @@ function App() {
   }, [viewScopedItems, selectedTagId]);
 
   const filteredItems = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-    const searchFilteredItems = !query
-      ? tagFilteredItems
-      : tagFilteredItems.filter((item) =>
-          [
-            item.filename,
-            item.title,
-            item.description,
-            item.sourceUrl,
-            item.hostname,
-            item.noteText,
-            item.tags.join(" "),
-          ]
-            .filter(Boolean)
-            .some((value) => value!.toLowerCase().includes(query)),
-        );
-
-    return searchFilteredItems.slice().sort((left, right) =>
-      compareItemsBySortOption(left, right, sortOption),
-    );
-  }, [tagFilteredItems, searchQuery, sortOption]);
+    return filterItems({
+      items: tagFilteredItems,
+      searchQuery: deferredSearchQuery,
+      filters: advancedFilters,
+      sortOption,
+    });
+  }, [advancedFilters, deferredSearchQuery, sortOption, tagFilteredItems]);
 
   const selectedItem =
     selectedIds.length === 1
@@ -4275,7 +4445,7 @@ function App() {
       if (!selectedCollectionId) {
         return false;
       }
-      if (searchQuery.trim().length > 0) {
+      if (hasActiveGridSubsetFilter) {
         return false;
       }
 
@@ -4317,7 +4487,7 @@ function App() {
         setIsActionInProgress(false);
       }
     },
-    [collectionScopedItems, reloadItemsFromDb, searchQuery, selectedCollectionId],
+    [collectionScopedItems, hasActiveGridSubsetFilter, reloadItemsFromDb, selectedCollectionId],
   );
 
   const duplicateItemsIntoSelectedCollectionAtDrop = useCallback(
@@ -4339,7 +4509,7 @@ function App() {
       if (
         duplicatedItems.length !== 1 ||
         !args.reorderTarget ||
-        searchQuery.trim().length > 0
+        hasActiveGridSubsetFilter
       ) {
         return true;
       }
@@ -4371,7 +4541,13 @@ function App() {
       }
       return true;
     },
-    [collectionScopedItems, duplicateItemsById, reloadItemsFromDb, searchQuery, selectedCollectionId],
+    [
+      collectionScopedItems,
+      duplicateItemsById,
+      hasActiveGridSubsetFilter,
+      reloadItemsFromDb,
+      selectedCollectionId,
+    ],
   );
 
   useEffect(() => {
@@ -4442,7 +4618,7 @@ function App() {
         nextActive.itemIds.length === 1 &&
         selectedCollectionId !== null &&
         nextActive.sourceCollectionId === selectedCollectionId &&
-        searchQuery.trim().length === 0;
+        !hasActiveGridSubsetFilter;
       const reorderTarget = canUseGridDropTarget
         ? itemGridReorderTargetFromPoint(event.clientX, event.clientY, nextActive.itemIds[0])
         : null;
@@ -4597,8 +4773,8 @@ function App() {
     clearPointerItemDrag,
     duplicateItemsIntoSelectedCollectionAtDrop,
     handleCollectionMembershipDrop,
+    hasActiveGridSubsetFilter,
     reorderSingleItemWithinSelectedCollection,
-    searchQuery,
     selectedCollectionId,
     setActiveCustomItemDrag,
     setGridReorderDropTarget,
@@ -5144,16 +5320,12 @@ function App() {
         <Topbar
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
-          activeTagFilter={
-            activeTagFilter
-              ? {
-                  id: activeTagFilter.id,
-                  name: activeTagFilter.name,
-                  color: activeTagFilter.color,
-                }
-              : null
-          }
-          onClearTagFilter={() => setSelectedTagId(null)}
+          availableTags={tags}
+          advancedFilters={advancedFilters}
+          onAdvancedFiltersChange={setAdvancedFilters}
+          activeFilterChips={activeTopbarFilterChips}
+          onRemoveFilterChip={handleRemoveTopbarFilterChip}
+          onClearAllFilterChips={handleClearAllTopbarFilters}
           tileSize={tileSize}
           onTileSizeChange={setTileSize}
           sortOption={sortOption}

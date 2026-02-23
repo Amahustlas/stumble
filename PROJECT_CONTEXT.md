@@ -106,7 +106,7 @@ This is not in MVP, but architecture should keep room for:
 - Videos: show thumbnail in grid (duration badge later).
 - PDFs: show first-page thumbnail (later).
 - Bookmarks: show favicon; optional manually-added screenshot per bookmark.
-- Grid tile size should be resizable in the future (slider).
+- Grid tile size is adjustable via topbar slider (future refinements still expected).
 
 ---
 
@@ -121,7 +121,7 @@ Must have in Phase 1 UI scaffold:
 - Item select and preview panel
 - Search state and UI
 - Multi-select behavior (Ctrl/Shift)
-- UI slot for future tile-size slider (actual resizing can be deferred if needed)
+- Tile-size slider for grid
 
 Must prepare for later multi-item actions (not fully implemented yet):
 - delete
@@ -162,7 +162,7 @@ Stumble owns managed storage copies.
 
 Structure:
 - Left sidebar: collections tree + tags (behavior inspired by Eagle/ChatGPT sidebar patterns)
-- Topbar: search + add/import controls + reserved slot for tile-size slider
+- Topbar: search + filter controls + sort + add/import controls + tile-size slider
 - Main area: responsive grid/list for items
 - Right panel: detailed item preview and editable description
 
@@ -183,6 +183,9 @@ Current reality (implemented/in progress):
 - local filesystem storage + import pipeline is in use
 - thumbnail and bookmark metadata flows exist (still being refined)
 - sidebar + preview panel UX is being iterated for speed and consistency
+- debounced in-memory search + advanced filters (type/tags/rating/favorites) are wired into current view contexts
+- sorting is integrated with filtering (newest/oldest/name/rating)
+- search query + active filters + sort state persist in localStorage across reloads
 
 Current focus:
 - polish organization UX (collections/tags)

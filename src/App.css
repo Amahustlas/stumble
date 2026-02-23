@@ -578,8 +578,16 @@ textarea {
   grid-template-rows: auto auto;
 }
 
-.topbar-search input {
+.topbar-search {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.topbar-search-input {
   width: 100%;
+  min-width: 0;
   background: var(--color-panel-elevated);
   border: 1px solid var(--color-border);
   border-radius: 8px;
@@ -587,8 +595,149 @@ textarea {
   color: var(--color-text);
 }
 
-.topbar-search input:focus {
+.topbar-search-input:focus {
   outline: 1px solid var(--color-accent);
+}
+
+.topbar-filter-popover-anchor {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.topbar-filter-button {
+  min-height: 38px;
+  border: 1px solid var(--color-border);
+  background: var(--color-panel-elevated);
+  border-radius: 8px;
+  padding: 0 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text);
+  white-space: nowrap;
+}
+
+.topbar-filter-button:hover {
+  background: var(--color-hover);
+}
+
+.topbar-filter-button.active {
+  border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border));
+  background: color-mix(in srgb, var(--color-selected) 30%, var(--color-panel-elevated));
+}
+
+.topbar-filter-button-count {
+  min-width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 72%, transparent);
+  background: color-mix(in srgb, var(--color-panel) 55%, transparent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: var(--color-muted);
+  padding: 0 5px;
+}
+
+.topbar-filter-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(360px, calc(100vw - 40px));
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-panel) 94%, #06080c);
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.35);
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+  z-index: 30;
+}
+
+.topbar-filter-section {
+  border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-panel-elevated) 72%, transparent);
+  padding: 8px;
+  display: grid;
+  gap: 7px;
+}
+
+.topbar-filter-section-title {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+
+.topbar-filter-checkbox-list {
+  display: grid;
+  gap: 5px;
+}
+
+.topbar-filter-tag-list {
+  max-height: 160px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.topbar-filter-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.topbar-filter-checkbox input {
+  margin: 0;
+}
+
+.topbar-filter-tag-label {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.topbar-filter-tag-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #000 35%, var(--color-border));
+  flex: 0 0 auto;
+}
+
+.topbar-filter-empty {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.topbar-filter-inline-fields {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.topbar-filter-field {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.topbar-filter-field select {
+  border: 1px solid var(--color-border);
+  background: var(--color-panel-elevated);
+  color: var(--color-text);
+  border-radius: 7px;
+  padding: 6px 8px;
+}
+
+.topbar-filter-checkbox-inline {
+  border-top: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+  padding-top: 7px;
 }
 
 .topbar-actions {
@@ -611,6 +760,29 @@ textarea {
   flex: 0 0 auto;
 }
 
+.topbar-filter-chip-pill {
+  min-height: 24px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-panel-elevated) 70%, transparent);
+  color: var(--color-text);
+  padding: 2px 6px 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.topbar-filter-chip-pill:hover {
+  background: color-mix(in srgb, var(--color-hover) 70%, transparent);
+  border-color: color-mix(in srgb, var(--color-accent) 30%, var(--color-border));
+}
+
+.topbar-filter-chip-label {
+  white-space: nowrap;
+}
+
 .topbar-filter-chip-close {
   width: 14px;
   height: 14px;
@@ -627,6 +799,23 @@ textarea {
 .topbar-filter-chip:hover .topbar-filter-chip-close,
 .topbar-filter-chip.active .topbar-filter-chip-close {
   color: var(--color-text);
+}
+
+.topbar-filter-clear-all {
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-muted);
+  border-radius: 999px;
+  min-height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.topbar-filter-clear-all:hover {
+  color: var(--color-text);
+  background: color-mix(in srgb, var(--color-hover) 70%, transparent);
 }
 
 .topbar-actions button {

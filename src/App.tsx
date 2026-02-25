@@ -16,6 +16,7 @@ import ItemGrid from "./components/ItemGrid";
 import PreviewPanel from "./components/PreviewPanel";
 import Sidebar from "./components/Sidebar";
 import Topbar, { type TopbarFilterChip, type TopbarSortOption } from "./components/Topbar";
+import ViewerCenter from "./components/ViewerCenter";
 import {
   initDb,
   loadDbAppState,
@@ -1299,8 +1300,7 @@ function App() {
   );
   const [tileSize, setTileSize] = useState(220);
   const [nativeDropEnabled, setNativeDropEnabled] = useState(false);
-  const [imageModalOpen, setImageModalOpen] = useState(false);
-  const [imageModalItemId, setImageModalItemId] = useState<string | null>(null);
+  const [activeViewerItemId, setActiveViewerItemId] = useState<string | null>(null);
   const [deleteConfirmItemIds, setDeleteConfirmItemIds] = useState<string[]>([]);
   const [moveTargetItemIds, setMoveTargetItemIds] = useState<string[]>([]);
   const [deleteCollectionConfirm, setDeleteCollectionConfirm] = useState<{
@@ -1412,6 +1412,7 @@ function App() {
     selectedTagId !== null ||
     searchQuery.trim().length > 0 ||
     hasActiveAdvancedItemFilters(advancedFilters);
+  const canUseManualGridReorder = sortOption === "newest" && !hasActiveGridSubsetFilter;
 
   const activeTopbarFilterChips = useMemo<TopbarFilterChip[]>(() => {
     const chips: TopbarFilterChip[] = [];
@@ -4055,9 +4056,8 @@ function App() {
         return;
       }
 
-      if (imageModalOpen) {
-        setImageModalOpen(false);
-        setImageModalItemId(null);
+      if (activeViewerItemId !== null) {
+        setActiveViewerItemId(null);
         return;
       }
 
@@ -4069,7 +4069,7 @@ function App() {
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
   }, [
-    imageModalOpen,
+    activeViewerItemId,
     deleteCollectionConfirm,
     deleteConfirmItemIds.length,
     moveTargetItemIds.length,
@@ -4174,7 +4174,7 @@ function App() {
       if (event.key !== "Delete") return;
       if (selectedIds.length === 0) return;
       if (isEditableTarget(event.target)) return;
-      if (imageModalOpen || deleteConfirmItemIds.length > 0 || moveTargetItemIds.length > 0) {
+      if (activeViewerItemId !== null || deleteConfirmItemIds.length > 0 || moveTargetItemIds.length > 0) {
         return;
       }
 
@@ -4187,7 +4187,7 @@ function App() {
     return () => window.removeEventListener("keydown", handleDeleteKey);
   }, [
     selectedIds,
-    imageModalOpen,
+    activeViewerItemId,
     deleteConfirmItemIds.length,
     moveTargetItemIds.length,
     requestDeleteItems,
@@ -4285,8 +4285,9 @@ function App() {
       searchQuery: deferredSearchQuery,
       filters: advancedFilters,
       sortOption,
+      skipSort: canUseManualGridReorder,
     });
-  }, [advancedFilters, deferredSearchQuery, sortOption, tagFilteredItems]);
+  }, [advancedFilters, canUseManualGridReorder, deferredSearchQuery, sortOption, tagFilteredItems]);
 
   const selectedItem =
     selectedIds.length === 1
@@ -4306,10 +4307,20 @@ function App() {
         })()
       : null;
 
-  const modalItem =
-    imageModalItemId !== null
-      ? items.find((item) => item.id === imageModalItemId) ?? null
-      : null;
+  const viewerItems = useMemo(
+    () =>
+      filteredItems.filter(
+        (item): item is Item & { type: "image"; previewUrl: string } =>
+          item.type === "image" && typeof item.previewUrl === "string" && item.previewUrl.length > 0,
+      ),
+    [filteredItems],
+  );
+  const activeViewerIndex = useMemo(
+    () =>
+      activeViewerItemId !== null ? viewerItems.findIndex((item) => item.id === activeViewerItemId) : -1,
+    [activeViewerItemId, viewerItems],
+  );
+  const activeViewerItem = activeViewerIndex >= 0 ? viewerItems[activeViewerIndex] : null;
   const contextMenuItem =
     contextMenu.itemId !== null
       ? items.find((item) => item.id === contextMenu.itemId) ?? null
@@ -4445,7 +4456,7 @@ function App() {
       if (!selectedCollectionId) {
         return false;
       }
-      if (hasActiveGridSubsetFilter) {
+      if (!canUseManualGridReorder) {
         return false;
       }
 
@@ -4487,7 +4498,55 @@ function App() {
         setIsActionInProgress(false);
       }
     },
-    [collectionScopedItems, hasActiveGridSubsetFilter, reloadItemsFromDb, selectedCollectionId],
+    [canUseManualGridReorder, collectionScopedItems, reloadItemsFromDb, selectedCollectionId],
+  );
+
+  const reorderSingleItemWithinAllItems = useCallback(
+    (args: { draggedItemId: string; targetItemId: string; position: "before" | "after" }) => {
+      if (selectedCollectionId !== null || libraryViewMode !== "all") {
+        return false;
+      }
+      if (!canUseManualGridReorder) {
+        return false;
+      }
+
+      const orderedIds = collectionScopedItems.map((item) => item.id);
+      const fromIndex = orderedIds.indexOf(args.draggedItemId);
+      const targetIndex = orderedIds.indexOf(args.targetItemId);
+      if (fromIndex === -1 || targetIndex === -1 || fromIndex === targetIndex) {
+        return false;
+      }
+
+      const nextOrderedIds = [...orderedIds];
+      const [draggedItemId] = nextOrderedIds.splice(fromIndex, 1);
+      let insertIndex = nextOrderedIds.indexOf(args.targetItemId);
+      if (insertIndex === -1) {
+        return false;
+      }
+      if (args.position === "after") {
+        insertIndex += 1;
+      }
+      nextOrderedIds.splice(insertIndex, 0, draggedItemId);
+
+      const noOp = nextOrderedIds.every((id, index) => id === orderedIds[index]);
+      if (noOp) {
+        return false;
+      }
+
+      const nextOrderIndexById = new Map(nextOrderedIds.map((id, index) => [id, index]));
+      setItems((itemsState) =>
+        itemsState.slice().sort((left, right) => {
+          const leftIndex = nextOrderIndexById.get(left.id);
+          const rightIndex = nextOrderIndexById.get(right.id);
+          if (leftIndex === undefined && rightIndex === undefined) return 0;
+          if (leftIndex === undefined) return 1;
+          if (rightIndex === undefined) return -1;
+          return leftIndex - rightIndex;
+        }),
+      );
+      return true;
+    },
+    [canUseManualGridReorder, collectionScopedItems, libraryViewMode, selectedCollectionId],
   );
 
   const duplicateItemsIntoSelectedCollectionAtDrop = useCallback(
@@ -4509,7 +4568,7 @@ function App() {
       if (
         duplicatedItems.length !== 1 ||
         !args.reorderTarget ||
-        hasActiveGridSubsetFilter
+        !canUseManualGridReorder
       ) {
         return true;
       }
@@ -4544,8 +4603,47 @@ function App() {
     [
       collectionScopedItems,
       duplicateItemsById,
-      hasActiveGridSubsetFilter,
+      canUseManualGridReorder,
       reloadItemsFromDb,
+      selectedCollectionId,
+    ],
+  );
+
+  const duplicateItemsIntoAllItemsAtDrop = useCallback(
+    async (args: {
+      itemIds: string[];
+      reorderTarget?: GridReorderDropTarget | null;
+    }): Promise<boolean> => {
+      if (selectedCollectionId !== null || libraryViewMode !== "all") {
+        return false;
+      }
+
+      const duplicatedItems = await duplicateItemsById(args.itemIds, {
+        closeContextMenu: false,
+      });
+      if (!duplicatedItems || duplicatedItems.length === 0) {
+        return false;
+      }
+
+      if (
+        duplicatedItems.length !== 1 ||
+        !args.reorderTarget ||
+        !canUseManualGridReorder
+      ) {
+        return true;
+      }
+
+      return reorderSingleItemWithinAllItems({
+        draggedItemId: duplicatedItems[0].id,
+        targetItemId: args.reorderTarget.itemId,
+        position: args.reorderTarget.position,
+      });
+    },
+    [
+      canUseManualGridReorder,
+      duplicateItemsById,
+      libraryViewMode,
+      reorderSingleItemWithinAllItems,
       selectedCollectionId,
     ],
   );
@@ -4614,11 +4712,18 @@ function App() {
       const mode: "move" | "duplicate" =
         rawAltCopy || nextActive.mode === "duplicate" ? "duplicate" : "move";
       activeItemDragAltRef.current = mode === "duplicate";
-      const canUseGridDropTarget =
+      const canUseGridDropTargetInSelectedCollection =
         nextActive.itemIds.length === 1 &&
         selectedCollectionId !== null &&
         nextActive.sourceCollectionId === selectedCollectionId &&
-        !hasActiveGridSubsetFilter;
+        canUseManualGridReorder;
+      const canUseGridDropTargetInAllItems =
+        nextActive.itemIds.length === 1 &&
+        selectedCollectionId === null &&
+        libraryViewMode === "all" &&
+        canUseManualGridReorder;
+      const canUseGridDropTarget =
+        canUseGridDropTargetInSelectedCollection || canUseGridDropTargetInAllItems;
       const reorderTarget = canUseGridDropTarget
         ? itemGridReorderTargetFromPoint(event.clientX, event.clientY, nextActive.itemIds[0])
         : null;
@@ -4682,9 +4787,13 @@ function App() {
 
       const reorderDropTarget = gridReorderDropStateRef.current;
       const droppedInsideItemGrid =
-        selectedCollectionId !== null &&
-        active.sourceCollectionId === selectedCollectionId &&
-        isPointInsideItemGridArea(event.clientX, event.clientY);
+        isPointInsideItemGridArea(event.clientX, event.clientY) &&
+        canUseManualGridReorder &&
+        (
+          (selectedCollectionId !== null && active.sourceCollectionId === selectedCollectionId) ||
+          (selectedCollectionId === null && libraryViewMode === "all")
+        ) &&
+        active.itemIds.length >= 1;
       const finalTargetCollectionId =
         collectionDropTargetIdFromPoint(event.clientX, event.clientY) ?? active.targetCollectionId;
       const finalMode: "move" | "duplicate" =
@@ -4707,29 +4816,54 @@ function App() {
       if (
         finalMode === "move" &&
         reorderDropTarget &&
-        active.itemIds.length === 1 &&
-        selectedCollectionId !== null &&
-        active.sourceCollectionId === selectedCollectionId
+        active.itemIds.length === 1
       ) {
-        void reorderSingleItemWithinSelectedCollection({
-          draggedItemId: active.itemIds[0],
-          targetItemId: reorderDropTarget.itemId,
-          position: reorderDropTarget.position,
-        });
-        return;
+        if (
+          selectedCollectionId !== null &&
+          active.sourceCollectionId === selectedCollectionId
+        ) {
+          void reorderSingleItemWithinSelectedCollection({
+            draggedItemId: active.itemIds[0],
+            targetItemId: reorderDropTarget.itemId,
+            position: reorderDropTarget.position,
+          });
+          return;
+        }
+
+        if (selectedCollectionId === null && libraryViewMode === "all") {
+          void Promise.resolve(
+            reorderSingleItemWithinAllItems({
+              draggedItemId: active.itemIds[0],
+              targetItemId: reorderDropTarget.itemId,
+              position: reorderDropTarget.position,
+            }),
+          );
+          return;
+        }
       }
 
       if (
         finalMode === "duplicate" &&
-        selectedCollectionId !== null &&
-        active.sourceCollectionId === selectedCollectionId &&
         (reorderDropTarget || droppedInsideItemGrid)
       ) {
-        void duplicateItemsIntoSelectedCollectionAtDrop({
-          itemIds: active.itemIds,
-          reorderTarget: reorderDropTarget,
-        });
-        return;
+        if (
+          selectedCollectionId !== null &&
+          active.sourceCollectionId === selectedCollectionId
+        ) {
+          void duplicateItemsIntoSelectedCollectionAtDrop({
+            itemIds: active.itemIds,
+            reorderTarget: reorderDropTarget,
+          });
+          return;
+        }
+
+        if (selectedCollectionId === null && libraryViewMode === "all") {
+          void duplicateItemsIntoAllItemsAtDrop({
+            itemIds: active.itemIds,
+            reorderTarget: reorderDropTarget,
+          });
+          return;
+        }
       }
 
       if (!finalTargetCollectionId) {
@@ -4771,9 +4905,12 @@ function App() {
     };
   }, [
     clearPointerItemDrag,
+    canUseManualGridReorder,
     duplicateItemsIntoSelectedCollectionAtDrop,
+    duplicateItemsIntoAllItemsAtDrop,
     handleCollectionMembershipDrop,
-    hasActiveGridSubsetFilter,
+    libraryViewMode,
+    reorderSingleItemWithinAllItems,
     reorderSingleItemWithinSelectedCollection,
     selectedCollectionId,
     setActiveCustomItemDrag,
@@ -5069,9 +5206,51 @@ function App() {
   const handleItemDoubleClick = (item: Item) => {
     if (item.type !== "image" || !item.previewUrl) return;
     closeContextMenu();
-    setImageModalItemId(item.id);
-    setImageModalOpen(true);
+    setActiveViewerItemId(item.id);
   };
+
+  const closeImageViewer = useCallback(() => {
+    setActiveViewerItemId(null);
+  }, []);
+
+  const navigateImageViewer = useCallback(
+    (delta: -1 | 1) => {
+      if (activeViewerIndex < 0) {
+        return;
+      }
+      const nextIndex = activeViewerIndex + delta;
+      if (nextIndex < 0 || nextIndex >= viewerItems.length) {
+        return;
+      }
+      setActiveViewerItemId(viewerItems[nextIndex].id);
+    },
+    [activeViewerIndex, viewerItems],
+  );
+
+  useEffect(() => {
+    if (activeViewerItemId === null) {
+      return;
+    }
+
+    const handleViewerNavigationKeys = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return;
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        navigateImageViewer(-1);
+        return;
+      }
+
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        navigateImageViewer(1);
+      }
+    };
+
+    window.addEventListener("keydown", handleViewerNavigationKeys);
+    return () => window.removeEventListener("keydown", handleViewerNavigationKeys);
+  }, [activeViewerItemId, navigateImageViewer]);
 
   const handleItemContextMenu = (item: Item, event: React.MouseEvent) => {
     event.preventDefault();
@@ -5154,8 +5333,7 @@ function App() {
     if (action === "open") {
       const item = items.find((entry) => entry.id === itemId);
       if (item?.type === "image" && item.previewUrl) {
-        setImageModalItemId(item.id);
-        setImageModalOpen(true);
+        setActiveViewerItemId(item.id);
       }
       closeContextMenu();
       return;
@@ -5193,7 +5371,7 @@ function App() {
         return;
       }
       if (isEditableTarget(event.target)) return;
-      if (imageModalOpen || deleteConfirmItemIds.length > 0 || moveTargetItemIds.length > 0) {
+      if (activeViewerItemId !== null || deleteConfirmItemIds.length > 0 || moveTargetItemIds.length > 0) {
         return;
       }
 
@@ -5220,12 +5398,21 @@ function App() {
     contextMenu.itemId,
     deleteConfirmItemIds.length,
     duplicateItemsById,
-    imageModalOpen,
+    activeViewerItemId,
     moveTargetItemIds.length,
     resolveActionTargetIds,
     selectedIds,
     closeContextMenu,
   ]);
+
+  useEffect(() => {
+    if (activeViewerItemId === null) {
+      return;
+    }
+    if (!activeViewerItem) {
+      setActiveViewerItemId(null);
+    }
+  }, [activeViewerItemId, activeViewerItem]);
 
   const moveTargetCollectionIds = useMemo(() => {
     const ids = new Set(moveTargetItemIds);
@@ -5282,6 +5469,7 @@ function App() {
         } as React.CSSProperties
       }
     >
+      <>
         <Sidebar
           collections={collectionTree}
           tags={tags}
@@ -5304,92 +5492,104 @@ function App() {
           onDropTagOnItem={addTagToItem}
           collectionDropTargetId={sidebarCollectionDropState?.collectionId ?? null}
           collectionDropMode={sidebarCollectionDropState?.mode ?? null}
-        onCollectionDragOver={handleSidebarCollectionDragOver}
-        onCollectionDragLeave={handleSidebarCollectionDragLeave}
-        onCollectionDrop={handleSidebarCollectionDrop}
-      />
-      <div
-        className="panel-resize-handle panel-resize-handle-left"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize sidebar"
-        onMouseDown={handleStartLeftPanelResize}
-      />
+          onCollectionDragOver={handleSidebarCollectionDragOver}
+          onCollectionDragLeave={handleSidebarCollectionDragLeave}
+          onCollectionDrop={handleSidebarCollectionDrop}
+        />
+        <div
+          className="panel-resize-handle panel-resize-handle-left"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          onMouseDown={handleStartLeftPanelResize}
+        />
 
-      <section className="content-layout">
-        <Topbar
-          searchQuery={searchQuery}
-          onSearchChange={setSearchQuery}
+        <section className="content-layout">
+          {activeViewerItem ? (
+            <ViewerCenter
+              item={activeViewerItem}
+              imageIndex={activeViewerIndex}
+              imageCount={viewerItems.length}
+              onBack={closeImageViewer}
+            />
+          ) : (
+            <>
+            <Topbar
+              searchQuery={searchQuery}
+              onSearchChange={setSearchQuery}
+              availableTags={tags}
+              advancedFilters={advancedFilters}
+              onAdvancedFiltersChange={setAdvancedFilters}
+              activeFilterChips={activeTopbarFilterChips}
+              onRemoveFilterChip={handleRemoveTopbarFilterChip}
+              onClearAllFilterChips={handleClearAllTopbarFilters}
+              tileSize={tileSize}
+              onTileSizeChange={setTileSize}
+              sortOption={sortOption}
+              onSortOptionChange={setSortOption}
+              onAddUrl={handleAddUrl}
+              onImport={() => {
+                void handleImportFromPicker();
+              }}
+            />
+            <input
+              ref={filePickerInputRef}
+              type="file"
+              multiple
+              hidden
+              onChange={(event) => {
+                const inputFiles = event.currentTarget.files;
+                if (inputFiles && inputFiles.length > 0) {
+                  void importFileObjectsToVault(Array.from(inputFiles));
+                }
+                event.currentTarget.value = "";
+              }}
+            />
+            <ItemGrid
+              items={filteredItems}
+              selectedIds={selectedIds}
+              tileSize={tileSize}
+              reorderDropTargetItemId={gridReorderDropState?.itemId ?? null}
+              reorderDropPosition={gridReorderDropState?.position ?? null}
+              onSelectItem={handleSelectItem}
+              onEmptyAreaClick={handleItemGridEmptyAreaClick}
+              onItemPointerDown={handleItemPointerDown}
+              onItemDoubleClick={handleItemDoubleClick}
+              onItemContextMenu={handleItemContextMenu}
+              onImageThumbnailMissing={handleImageThumbnailMissing}
+              onDropFiles={handleDropFiles}
+              onDropTagOnItem={addTagToItem}
+            />
+            </>
+          )}
+        </section>
+
+        <div
+          className="panel-resize-handle panel-resize-handle-right"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize preview panel"
+          onMouseDown={handleStartRightPanelResize}
+        />
+
+        <PreviewPanel
+          selectedCount={selectedIds.length}
+          item={selectedItem}
           availableTags={tags}
-          advancedFilters={advancedFilters}
-          onAdvancedFiltersChange={setAdvancedFilters}
-          activeFilterChips={activeTopbarFilterChips}
-          onRemoveFilterChip={handleRemoveTopbarFilterChip}
-          onClearAllFilterChips={handleClearAllTopbarFilters}
-          tileSize={tileSize}
-          onTileSizeChange={setTileSize}
-          sortOption={sortOption}
-          onSortOptionChange={setSortOption}
-          onAddUrl={handleAddUrl}
-          onImport={() => {
-            void handleImportFromPicker();
+          onDescriptionChange={handleDescriptionChange}
+          onSetItemRating={handleSetItemRating}
+          onToggleItemFavorite={handleToggleItemFavorite}
+          onUpdateItemTags={updateItemTagIds}
+          onOpenBookmarkUrl={handleOpenBookmarkUrl}
+          onDeleteSelection={() => requestDeleteItems(selectedIds)}
+          onMoveSelection={() => requestMoveItems(selectedIds)}
+          onDuplicateSelection={() => {
+            void duplicateItemsById(selectedIds);
           }}
         />
-        <input
-          ref={filePickerInputRef}
-          type="file"
-          multiple
-          hidden
-          onChange={(event) => {
-            const inputFiles = event.currentTarget.files;
-            if (inputFiles && inputFiles.length > 0) {
-              void importFileObjectsToVault(Array.from(inputFiles));
-            }
-            event.currentTarget.value = "";
-          }}
-        />
-        <ItemGrid
-          items={filteredItems}
-          selectedIds={selectedIds}
-          tileSize={tileSize}
-          reorderDropTargetItemId={gridReorderDropState?.itemId ?? null}
-          reorderDropPosition={gridReorderDropState?.position ?? null}
-          onSelectItem={handleSelectItem}
-          onEmptyAreaClick={handleItemGridEmptyAreaClick}
-          onItemPointerDown={handleItemPointerDown}
-          onItemDoubleClick={handleItemDoubleClick}
-          onItemContextMenu={handleItemContextMenu}
-          onImageThumbnailMissing={handleImageThumbnailMissing}
-          onDropFiles={handleDropFiles}
-          onDropTagOnItem={addTagToItem}
-        />
-      </section>
+      </>
 
-      <div
-        className="panel-resize-handle panel-resize-handle-right"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize preview panel"
-        onMouseDown={handleStartRightPanelResize}
-      />
-
-      <PreviewPanel
-        selectedCount={selectedIds.length}
-        item={selectedItem}
-        availableTags={tags}
-        onDescriptionChange={handleDescriptionChange}
-        onSetItemRating={handleSetItemRating}
-        onToggleItemFavorite={handleToggleItemFavorite}
-        onUpdateItemTags={updateItemTagIds}
-        onOpenBookmarkUrl={handleOpenBookmarkUrl}
-        onDeleteSelection={() => requestDeleteItems(selectedIds)}
-        onMoveSelection={() => requestMoveItems(selectedIds)}
-        onDuplicateSelection={() => {
-          void duplicateItemsById(selectedIds);
-        }}
-      />
-
-      {customItemDragState && (
+      {!activeViewerItem && customItemDragState && (
         <div
           className={`custom-item-drag-ghost ${
             customItemDragState.mode === "duplicate" ? "duplicate" : "move"
@@ -5601,46 +5801,6 @@ function App() {
               >
                 Cancel
               </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {imageModalOpen && modalItem?.type === "image" && modalItem.previewUrl && (
-        <div
-          className="image-modal-backdrop"
-          onClick={() => {
-            setImageModalOpen(false);
-            setImageModalItemId(null);
-          }}
-          role="presentation"
-        >
-          <div
-            className="image-modal-content"
-            onClick={(event) => event.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-            aria-label="Fullscreen image preview"
-          >
-            <header className="image-modal-header">
-              <div className="image-modal-title">
-                {modalItem.filename || modalItem.title}
-              </div>
-              <div className="image-modal-controls-placeholder" />
-            </header>
-            <button
-              type="button"
-              className="image-modal-close"
-              onClick={() => {
-                setImageModalOpen(false);
-                setImageModalItemId(null);
-              }}
-              aria-label="Close preview"
-            >
-              X
-            </button>
-            <div className="image-modal-body">
-              <img src={modalItem.previewUrl} alt={modalItem.title} />
             </div>
           </div>
         </div>

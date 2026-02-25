@@ -426,6 +426,13 @@ fn run_db_migrations(connection: &Connection) -> Result<(), String> {
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS item_overlays (
+                item_id TEXT PRIMARY KEY,
+                strokes_json TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_vault_files_ref_count ON vault_files(ref_count);
             "#,
         )
@@ -3972,6 +3979,64 @@ fn update_item_description(item_id: String, description: String) -> Result<i64, 
 }
 
 #[tauri::command]
+fn load_item_overlay(item_id: String) -> Result<Option<serde_json::Value>, String> {
+    let normalized_item_id = normalize_trimmed_id(&item_id)
+        .ok_or_else(|| "item id cannot be empty".to_string())?;
+
+    initialize_db()?;
+    let connection = open_db_connection()?;
+
+    let strokes_json = connection
+        .query_row(
+            "SELECT strokes_json FROM item_overlays WHERE item_id = ?1",
+            params![normalized_item_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| format!("failed to load item overlay: {}", err))?;
+
+    let Some(strokes_json) = strokes_json else {
+        return Ok(None);
+    };
+
+    let parsed = serde_json::from_str::<serde_json::Value>(&strokes_json)
+        .map_err(|err| format!("failed to parse stored item overlay JSON: {}", err))?;
+    Ok(Some(parsed))
+}
+
+#[tauri::command]
+fn save_item_overlay(item_id: String, strokes: serde_json::Value) -> Result<i64, String> {
+    let normalized_item_id = normalize_trimmed_id(&item_id)
+        .ok_or_else(|| "item id cannot be empty".to_string())?;
+    if !strokes.is_array() {
+        return Err("overlay strokes payload must be an array".to_string());
+    }
+
+    initialize_db()?;
+    let connection = open_db_connection()?;
+    let updated_at = Utc::now().timestamp_millis();
+    let strokes_json = serde_json::to_string(&strokes)
+        .map_err(|err| format!("failed to serialize item overlay JSON: {}", err))?;
+
+    let affected_rows = connection
+        .execute(
+            "INSERT INTO item_overlays (item_id, strokes_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_id) DO UPDATE SET
+               strokes_json = excluded.strokes_json,
+               updated_at = excluded.updated_at",
+            params![normalized_item_id, strokes_json, updated_at],
+        )
+        .map_err(|err| format!("failed to save item overlay: {}", err))?;
+
+    if affected_rows == 0 {
+        return Err("failed to save item overlay".to_string());
+    }
+
+    Ok(updated_at)
+}
+
+#[tauri::command]
 fn update_item_preferences(input: UpdateItemPreferencesInput) -> Result<i64, String> {
     initialize_db()?;
     let connection = open_db_connection()?;
@@ -4445,6 +4510,8 @@ pub fn run() {
             update_items_collection,
             update_item_tags,
             update_item_description,
+            load_item_overlay,
+            save_item_overlay,
             update_item_preferences,
             update_item_bookmark_metadata,
             update_item_media_state,

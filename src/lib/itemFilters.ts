@@ -41,6 +41,7 @@ type FilterItemsArgs<TItem extends FilterableItem> = {
   searchQuery: string;
   filters: AdvancedItemFilters;
   sortOption: ItemListSortOption;
+  skipSort?: boolean;
 };
 
 export function createDefaultAdvancedItemFilters(): AdvancedItemFilters {
@@ -183,7 +184,7 @@ function itemTypeToFilterBucket(itemType: FilterableItemType): AdvancedItemFilte
 }
 
 export function filterItems<TItem extends FilterableItem>(args: FilterItemsArgs<TItem>): TItem[] {
-  const { items, searchQuery, filters, sortOption } = args;
+  const { items, searchQuery, filters, sortOption, skipSort = false } = args;
   const normalizedQuery = searchQuery.trim().toLowerCase();
   const selectedTypes = filters.types.length > 0 ? new Set(filters.types) : null;
   const selectedTagIds = filters.tagIds.length > 0 ? new Set(filters.tagIds) : null;
@@ -230,6 +231,10 @@ export function filterItems<TItem extends FilterableItem>(args: FilterItemsArgs<
       .filter((value): value is string => typeof value === "string" && value.length > 0)
       .some((value) => value.toLowerCase().includes(normalizedQuery));
   });
+
+  if (skipSort) {
+    return filtered;
+  }
 
   return filtered.slice().sort((left, right) => compareItemsBySortOption(left, right, sortOption));
 }

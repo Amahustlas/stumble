@@ -179,7 +179,15 @@ function ItemGrid({
                   ? `reorder-target reorder-target-${reorderDropPosition}`
                   : ""
               } ${tagDropTargetItemId === item.id ? "item-card-tag-drop-target" : ""}`}
-              onClick={(event) => onSelectItem(item.id, event)}
+              onClick={(event) => {
+                onSelectItem(item.id, event);
+                if (event.defaultPrevented) {
+                  return;
+                }
+                if (item.type === "image" && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+                  onItemDoubleClick(item);
+                }
+              }}
               onDoubleClick={() => onItemDoubleClick(item)}
               onContextMenu={(event) => onItemContextMenu(item, event)}
               onPointerDown={(event) => {
